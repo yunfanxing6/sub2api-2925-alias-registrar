@@ -222,13 +222,10 @@ class IMAP2925Client:
         conn = None
         try:
             conn = self._connect()
-            typ, data = conn.uid("search", None, "ALL")
+            typ, data = conn.select(self.folder, readonly=True)
             if typ != "OK" or not data or not data[0]:
                 return 0
-            uids = data[0].split()
-            if not uids:
-                return 0
-            return int(uids[-1])
+            return int(data[0])
         except Exception:
             return 0
         finally:
@@ -255,24 +252,25 @@ class IMAP2925Client:
             conn = None
             try:
                 conn = self._connect()
-                typ, data = conn.uid("search", None, "ALL")
+                typ, data = conn.select(self.folder, readonly=True)
                 if typ != "OK" or not data or not data[0]:
                     time.sleep(poll_interval_sec)
                     continue
 
-                all_uids = [int(x) for x in data[0].split() if x]
-                if not all_uids:
+                latest_msg_id = int(data[0])
+                if latest_msg_id <= 0:
                     time.sleep(poll_interval_sec)
                     continue
 
-                for uid in reversed(all_uids[-120:]):
-                    if uid <= since_uid:
+                start_msg_id = max(1, since_uid + 1, latest_msg_id - 119)
+                for msg_id in range(latest_msg_id, start_msg_id - 1, -1):
+                    if msg_id <= since_uid:
                         continue
-                    if uid in seen_uids:
+                    if msg_id in seen_uids:
                         continue
 
-                    typ_fetch, fetch_data = conn.uid("fetch", str(uid), "(RFC822)")
-                    seen_uids.add(uid)
+                    typ_fetch, fetch_data = conn.fetch(str(msg_id), "(RFC822)")
+                    seen_uids.add(msg_id)
                     if typ_fetch != "OK" or not fetch_data:
                         continue
 
@@ -294,17 +292,17 @@ class IMAP2925Client:
 
                     haystack = "\n".join([sender, subject, body]).lower()
                     route_headers = "\n".join([to_header, delivered_to, orig_to]).lower()
+                    has_route_headers = any([to_header.strip(), delivered_to.strip(), orig_to.strip()])
 
                     if "openai" not in haystack and "openai" not in route_headers:
                         continue
 
-                    if target and target not in route_headers:
-                        # Some providers rewrite To headers. Prefer target match but do not hard-fail.
-                        pass
+                    if target and has_route_headers and target not in route_headers:
+                        continue
 
                     m = OTP_REGEX.search("\n".join([subject, body]))
                     if m:
-                        return m.group(1), uid
+                        return m.group(1), msg_id
 
             except Exception:
                 pass
