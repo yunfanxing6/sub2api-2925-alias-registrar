@@ -33,6 +33,22 @@ def parse_group_ids(raw: str) -> list[int]:
     return result
 
 
+def parse_mail_sources(raw: str) -> list[str]:
+    allowed = {"tempmail_lol", "mailtm", "onesecmail", "duckmail"}
+    chosen: list[str] = []
+    for part in (raw or "").split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in allowed:
+            raise ValueError(f"unsupported mail source: {name}")
+        if name not in chosen:
+            chosen.append(name)
+    if not chosen:
+        raise ValueError("at least one mail source is required")
+    return chosen
+
+
 class Sub2APIClient:
     def __init__(
         self,
@@ -312,8 +328,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--concurrency", type=int, default=10, help="Account concurrency")
     parser.add_argument("--priority", type=int, default=1, help="Account priority")
     parser.add_argument("--count", type=int, default=1, help="How many accounts to register this run")
+    parser.add_argument("--max-attempts", type=int, default=5, help="Max mailbox attempts per target account")
+    parser.add_argument("--retry-sleep", type=float, default=3.0, help="Sleep seconds between failed attempts")
     parser.add_argument("--sleep", type=float, default=2.0, help="Sleep seconds between accounts")
     parser.add_argument("--history-file", default="", help="Optional JSONL run history file")
+    parser.add_argument(
+        "--mail-sources",
+        default="tempmail_lol,mailtm",
+        help="Comma-separated temp mail sources: tempmail_lol,mailtm,onesecmail,duckmail",
+    )
+    parser.add_argument("--duckmail-key", default="", help="Optional DuckMail API key")
     return parser
 
 
@@ -332,10 +356,13 @@ def main() -> int:
     try:
         sub2api_url = normalize_base_url(args.sub2api_url)
         group_ids = parse_group_ids(args.group_ids)
+        mail_sources = parse_mail_sources(args.mail_sources)
         if not args.admin_api_key and not args.admin_token and not args.admin_email:
             raise ValueError("provide --admin-api-key or --admin-token or --admin-email")
         if args.count <= 0:
             raise ValueError("count must be > 0")
+        if args.max_attempts <= 0:
+            raise ValueError("max-attempts must be > 0")
         if args.sub2api_timeout <= 0:
             raise ValueError("sub2api-timeout must be > 0")
         if args.concurrency <= 0:
@@ -365,6 +392,13 @@ def main() -> int:
     )
 
     runtime_ctx = threading.local()
+    registrar.DUCKMAIL_KEY = args.duckmail_key or ""
+    registrar.MAIL_SOURCES = {
+        "tempmail_lol": "tempmail_lol" in mail_sources,
+        "onesecmail": "onesecmail" in mail_sources,
+        "duckmail": "duckmail" in mail_sources,
+        "mailtm": "mailtm" in mail_sources,
+    }
     install_sub2api_bridge(
         client=client,
         redirect_uri=args.redirect_uri,
@@ -376,47 +410,63 @@ def main() -> int:
     )
 
     print("[Info] tempmail + Sub2API registrar started")
+    print(f"[Info] mail sources: {', '.join(mail_sources)}")
 
     success = 0
     for i in range(1, args.count + 1):
         print(f"\n========== account {i}/{args.count} ==========")
-        runtime_ctx.oauth_round = 0
-        runtime_ctx.current_email = ""
-        runtime_ctx.current_dev_token = ""
-        started = time.time()
+        account_started = time.time()
+        account_done = False
 
-        try:
-            result_json = registrar.run(args.proxy)
-            email_addr = str(getattr(runtime_ctx, "current_email", "") or "")
-            if not result_json:
-                raise RuntimeError("registrar.run returned None")
+        for attempt in range(1, args.max_attempts + 1):
+            runtime_ctx.oauth_round = 0
+            runtime_ctx.current_email = ""
+            runtime_ctx.current_dev_token = ""
+            started = time.time()
+            print(f"[*] attempt {attempt}/{args.max_attempts}")
 
-            account = json.loads(result_json)
-            print(f"[OK] account created: id={account.get('id')}, name={account.get('name')}")
-            success += 1
-            append_history(
-                args.history_file,
-                {
-                    "at": time.time(),
-                    "success": True,
-                    "email": email_addr,
-                    "account": account,
-                    "elapsed_sec": round(time.time() - started, 2),
-                },
-            )
-        except Exception as exc:
-            email_addr = str(getattr(runtime_ctx, "current_email", "") or "")
-            print(f"[failed] {exc}")
-            append_history(
-                args.history_file,
-                {
-                    "at": time.time(),
-                    "success": False,
-                    "email": email_addr,
-                    "error": str(exc),
-                    "elapsed_sec": round(time.time() - started, 2),
-                },
-            )
+            try:
+                result_json = registrar.run(args.proxy)
+                email_addr = str(getattr(runtime_ctx, "current_email", "") or "")
+                if not result_json:
+                    raise RuntimeError("registrar.run returned None")
+
+                account = json.loads(result_json)
+                print(f"[OK] account created: id={account.get('id')}, name={account.get('name')}")
+                success += 1
+                account_done = True
+                append_history(
+                    args.history_file,
+                    {
+                        "at": time.time(),
+                        "success": True,
+                        "email": email_addr,
+                        "attempt": attempt,
+                        "account": account,
+                        "elapsed_sec": round(time.time() - started, 2),
+                        "account_elapsed_sec": round(time.time() - account_started, 2),
+                    },
+                )
+                break
+            except Exception as exc:
+                email_addr = str(getattr(runtime_ctx, "current_email", "") or "")
+                print(f"[failed] attempt {attempt}: {exc}")
+                append_history(
+                    args.history_file,
+                    {
+                        "at": time.time(),
+                        "success": False,
+                        "email": email_addr,
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "elapsed_sec": round(time.time() - started, 2),
+                    },
+                )
+                if attempt < args.max_attempts and args.retry_sleep > 0:
+                    time.sleep(args.retry_sleep)
+
+        if not account_done:
+            print(f"[failed] account {i} exhausted {args.max_attempts} attempts")
 
         if i < args.count and args.sleep > 0:
             time.sleep(args.sleep)

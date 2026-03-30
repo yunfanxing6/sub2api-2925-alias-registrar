@@ -41,6 +41,8 @@ python3 sub2api_tempmail_registrar.py \
   --sub2api-url "https://openaiapi.icu" \
   --admin-api-key "YOUR_ADMIN_API_KEY" \
   --proxy "http://127.0.0.1:7890" \
+  --mail-sources "tempmail_lol,mailtm" \
+  --max-attempts 5 \
   --count 1
 ```
 
