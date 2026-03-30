@@ -1,6 +1,6 @@
 # sub2api-2925-alias-registrar
 
-Standalone registrar based on `a.py`, using 2925 IMAP mailbox aliases and Sub2API OAuth APIs.
+Standalone registrar scripts based on `a.py`, using either 2925 IMAP mailbox aliases or built-in temp mail, both bridged into Sub2API OAuth APIs.
 
 ## What it does
 
@@ -13,7 +13,8 @@ Standalone registrar based on `a.py`, using 2925 IMAP mailbox aliases and Sub2AP
 
 ## Files
 
-- `sub2api_2925_alias_registrar.py`: main script
+- `sub2api_2925_alias_registrar.py`: 2925 alias mailbox version
+- `sub2api_tempmail_registrar.py`: temp mail version based on `registrar_core.py`
 - `registrar_core.py`: core OpenAI flow adapted from local `a.py`
 
 ## Requirements
@@ -30,6 +31,16 @@ python3 sub2api_2925_alias_registrar.py \
   --proxy "http://127.0.0.1:7890" \
   --mail-login-email "yunfanxing6@2925.com" \
   --mail-login-password "YOUR_2925_PASSWORD" \
+  --count 1
+```
+
+Temp mail version:
+
+```bash
+python3 sub2api_tempmail_registrar.py \
+  --sub2api-url "https://openaiapi.icu" \
+  --admin-api-key "YOUR_ADMIN_API_KEY" \
+  --proxy "http://127.0.0.1:7890" \
   --count 1
 ```
 
