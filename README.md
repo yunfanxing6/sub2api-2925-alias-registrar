@@ -15,6 +15,7 @@ Standalone registrar scripts based on `a.py`, using either 2925 IMAP mailbox ali
 
 - `sub2api_2925_alias_registrar.py`: 2925 alias mailbox version
 - `sub2api_tempmail_registrar.py`: temp mail version based on `registrar_core.py`
+- `sub2api_browser_tempmail_registrar.py`: Chromium + Playwright temp mail version
 - `registrar_core.py`: core OpenAI flow adapted from local `a.py`
 
 ## Requirements
@@ -43,6 +44,18 @@ python3 sub2api_tempmail_registrar.py \
   --proxy "http://127.0.0.1:7890" \
   --mail-sources "tempmail_lol,mailtm" \
   --max-attempts 5 \
+  --count 1
+```
+
+Chromium browser automation version:
+
+```bash
+xvfb-run -a python3 sub2api_browser_tempmail_registrar.py \
+  --sub2api-url "https://openaiapi.icu" \
+  --admin-api-key "YOUR_ADMIN_API_KEY" \
+  --proxy "http://127.0.0.1:7890" \
+  --mail-sources "tempmail_lol,mailtm" \
+  --max-attempts 3 \
   --count 1
 ```
 
