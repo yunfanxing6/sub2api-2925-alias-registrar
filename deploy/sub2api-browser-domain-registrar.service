@@ -1,0 +1,18 @@
+[Unit]
+Description=Sub2API Browser Domain Registrar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/sub2api-browser-domain-registrar
+WorkingDirectory=/root/sub2api-2925-alias-registrar
+ExecStart=/root/sub2api-2925-alias-registrar/run_sub2api_browser_domain_registrar.sh
+Restart=always
+RestartSec=15
+KillMode=process
+StandardOutput=append:/var/log/sub2api-browser-domain-registrar.log
+StandardError=append:/var/log/sub2api-browser-domain-registrar.log
+
+[Install]
+WantedBy=multi-user.target

@@ -34,6 +34,34 @@ class NeedReauth(RuntimeError):
     pass
 
 
+class SkipMailbox(RuntimeError):
+    pass
+
+
+def is_retryable_cert_error(exc: Exception) -> bool:
+    return "ERR_CERT_VERIFIER_CHANGED" in str(exc)
+
+
+def goto_with_retry(page: Page, url: str, *, attempts: int = 3) -> None:
+    last_exc = None
+    for idx in range(1, attempts + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=120000)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if not is_retryable_cert_error(exc) or idx >= attempts:
+                raise
+            print(f"[warn] retrying navigation after cert verifier change ({idx}/{attempts})")
+            time.sleep(3)
+            try:
+                page.context.clear_cookies()
+            except Exception:
+                pass
+    if last_exc is not None:
+        raise last_exc
+
+
 def visible_text(page: Page) -> str:
     try:
         return page.locator("body").inner_text(timeout=2000)
@@ -354,6 +382,12 @@ def detect_phone_challenge(page: Page) -> bool:
         or "phone" in page.url.lower()
 
 
+def detect_unsupported_email(page: Page) -> bool:
+    text = visible_text(page).lower()
+    return any(token in text for token in ["unsupported_email", "not supported", "不受支持", "不支持该邮箱"]) \
+        or "unsupported_email" in page.url.lower()
+
+
 def is_email_otp_page(page: Page) -> bool:
     text = visible_text(page).lower()
     url = page.url.lower()
@@ -363,25 +397,48 @@ def is_email_otp_page(page: Page) -> bool:
             token in text
             for token in [
                 "验证码",
-                "code",
                 "check your inbox",
                 "检查您的收件箱",
                 "输入我们刚刚向",
                 "email verification",
+                "one-time code",
+                "one time code",
             ]
         )
     )
 
 
-def wait_for_callback(page: Page, redirect_uri: str, timeout_sec: int = 90) -> Optional[str]:
+def is_codex_consent_page(page: Page) -> bool:
+    text = visible_text(page).lower()
+    url = page.url.lower()
+    return (
+        "/consent" in url
+        or "登录到 codex" in text
+        or "chatgpt 将向 codex 提供" in text
+        or "sign in to codex" in text
+    )
+
+
+def wait_for_callback(page: Page, redirect_uri: str, timeout_sec: int = 90, requested_callback: Optional[dict[str, str]] = None) -> Optional[str]:
     deadline = time.time() + timeout_sec
     redirect_prefix = redirect_uri.split("?")[0]
+    clicked_consent = False
     while time.time() < deadline:
         current_url = page.url
         if current_url.startswith(redirect_prefix) and "code=" in current_url:
             return current_url
         if "localhost" in current_url and "code=" in current_url:
             return current_url
+        if requested_callback and requested_callback.get("url"):
+            return requested_callback["url"]
+        if is_codex_consent_page(page):
+            if not clicked_consent:
+                if maybe_click(page.get_by_role("button", name=re.compile(r"继续|continue|allow", re.I))):
+                    clicked_consent = True
+                    time.sleep(3)
+                    continue
+        if detect_unsupported_email(page):
+            raise SkipMailbox("unsupported_email")
         if detect_phone_challenge(page):
             raise NeedReauth("phone verification requested")
         time.sleep(1)
@@ -406,7 +463,19 @@ def perform_auth_flow(
     redirect_uri: str,
     signup: bool,
 ) -> str:
-    page.goto(auth_url, wait_until="domcontentloaded", timeout=120000)
+    redirect_prefix = redirect_uri.split("?")[0]
+    requested_callback: dict[str, str] = {"url": ""}
+
+    def on_request(req) -> None:
+        try:
+            url = req.url
+            if req.is_navigation_request() and url.startswith(redirect_prefix) and "code=" in url:
+                requested_callback["url"] = url
+        except Exception:
+            pass
+
+    page.on("request", on_request)
+    goto_with_retry(page, auth_url)
     try:
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
@@ -452,10 +521,12 @@ def perform_auth_flow(
             click_continue(page)
             time.sleep(3)
             wait_cloudflare(page, timeout_sec=60)
+            if detect_unsupported_email(page):
+                raise SkipMailbox("unsupported_email")
             if detect_phone_challenge(page):
                 if signup:
                     raise NeedReauth("phone verification requested")
-                raise FlowError("phone verification still required after reauth")
+                raise SkipMailbox("phone verification still required after reauth")
             continue
         if "localhost" in page.url and "code=" in page.url:
             break
@@ -465,7 +536,7 @@ def perform_auth_flow(
     time.sleep(3)
     wait_cloudflare(page, timeout_sec=60)
 
-    callback_url = wait_for_callback(page, redirect_uri, timeout_sec=120)
+    callback_url = wait_for_callback(page, redirect_uri, timeout_sec=120, requested_callback=requested_callback)
     if callback_url:
         return callback_url
     if detect_phone_challenge(page):
@@ -483,6 +554,9 @@ def launch_context(playwright, *, executable_path: str, headless: bool, artifact
             "--disable-dev-shm-usage",
             "--no-sandbox",
             "--start-maximized",
+            "--ignore-certificate-errors",
+            "--allow-insecure-localhost",
+            "--disable-features=CertVerifierService,ChromeRootStoreUsed",
         ],
     )
     context = browser.new_context(
@@ -490,6 +564,7 @@ def launch_context(playwright, *, executable_path: str, headless: bool, artifact
         locale="zh-CN",
         timezone_id="Asia/Tokyo",
         color_scheme="dark",
+        ignore_https_errors=True,
     )
     context.add_init_script(
         """
@@ -686,7 +761,11 @@ def main() -> int:
                                 print(f"[debug] page_text={visible_text(page)[:800]}")
                         except Exception:
                             pass
-                    print(f"[failed] attempt {attempt}: {exc}")
+                    reason = str(exc)
+                    if isinstance(exc, SkipMailbox):
+                        print(f"[skip] attempt {attempt}: {reason}; switching to next mailbox")
+                    else:
+                        print(f"[failed] attempt {attempt}: {reason}")
                     append_history(
                         args.history_file,
                         {
@@ -694,7 +773,8 @@ def main() -> int:
                             "success": False,
                             "email": email_addr,
                             "attempt": attempt,
-                            "error": str(exc),
+                            "error": reason,
+                            "skip_mailbox": isinstance(exc, SkipMailbox),
                             "elapsed_sec": round(time.time() - started, 2),
                         },
                     )

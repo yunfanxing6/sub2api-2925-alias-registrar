@@ -16,6 +16,8 @@ Standalone registrar scripts based on `a.py`, using either 2925 IMAP mailbox ali
 - `sub2api_2925_alias_registrar.py`: 2925 alias mailbox version
 - `sub2api_tempmail_registrar.py`: temp mail version based on `registrar_core.py`
 - `sub2api_browser_tempmail_registrar.py`: Chromium + Playwright temp mail version
+- `sub2api_browser_domain_registrar.py`: Chromium + custom-domain mailbox version
+- `sub2api_domain_history_stats.py`: success-rate summary for domain history JSONL
 - `registrar_core.py`: core OpenAI flow adapted from local `a.py`
 
 ## Requirements
@@ -58,6 +60,49 @@ xvfb-run -a python3 sub2api_browser_tempmail_registrar.py \
   --max-attempts 3 \
   --count 1
 ```
+
+Custom-domain mailbox version:
+
+```bash
+xvfb-run -a python3 sub2api_browser_domain_registrar.py \
+  --sub2api-url "http://127.0.0.1:8080" \
+  --admin-api-key "YOUR_ADMIN_API_KEY" \
+  --mail-domain "xingyunfan.dpdns.org" \
+  --imap-host "imap.2925.com" \
+  --imap-port 993 \
+  --imap-user "yunfanxing6@2925.com" \
+  --imap-password "YOUR_IMAP_PASSWORD" \
+  --count 1 \
+  --max-attempts 5
+```
+
+Loop one registration every 60 seconds:
+
+```bash
+xvfb-run -a python3 sub2api_browser_domain_registrar.py \
+  --sub2api-url "http://127.0.0.1:8080" \
+  --admin-api-key "YOUR_ADMIN_API_KEY" \
+  --mail-domain "xingyunfan.dpdns.org" \
+  --imap-host "imap.2925.com" \
+  --imap-port 993 \
+  --imap-user "yunfanxing6@2925.com" \
+  --imap-password "YOUR_IMAP_PASSWORD" \
+  --loop \
+  --sleep 60 \
+  --max-attempts 5
+```
+
+History stats:
+
+```bash
+python3 sub2api_domain_history_stats.py domain_history_service.jsonl
+```
+
+Systemd templates:
+
+- `deploy/sub2api-browser-domain-registrar.service`
+- `deploy/sub2api-browser-domain-registrar.env.example`
+- `deploy/sub2api-browser-domain-registrar.logrotate`
 
 ## VPS one-liner
 
