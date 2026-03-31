@@ -9,21 +9,21 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 import registrar_core as registrar
 from sub2api_tempmail_registrar import Sub2APIClient, normalize_base_url, parse_group_ids, parse_mail_sources
 
 
-def random_identity() -> tuple[str, str, str, str]:
+def random_identity() -> tuple[str, str, str, str, str]:
     first_names = ["James", "Mary", "John", "Emma", "Robert", "Sarah", "David", "Laura", "Michael", "Anna"]
     last_names = ["Smith", "Brown", "Wilson", "Taylor", "Clark", "Hall", "Lewis", "Young", "King", "Green"]
     first = random.choice(first_names)
     last = random.choice(last_names)
     year = str(random.randint(1990, 2004))
-    month = str(random.randint(1, 12))
-    day = str(random.randint(1, 28))
-    return first, last, year, month.zfill(2) + day.zfill(2)
+    month = str(random.randint(1, 12)).zfill(2)
+    day = str(random.randint(1, 28)).zfill(2)
+    return first, last, year, month, day
 
 
 class FlowError(RuntimeError):
@@ -56,6 +56,28 @@ def maybe_fill(locator, value: str) -> bool:
         if locator.count() > 0 and locator.first.is_visible():
             locator.first.click(timeout=3000)
             locator.first.fill(value, timeout=3000)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def maybe_type_widget(page: Page, locator, value: str) -> bool:
+    try:
+        if locator.count() > 0 and locator.first.is_visible():
+            locator.first.evaluate(
+                """
+                el => {
+                  el.focus();
+                  const sel = window.getSelection();
+                  const range = document.createRange();
+                  range.selectNodeContents(el);
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                }
+                """
+            )
+            page.keyboard.type(value, delay=50)
             return True
     except Exception:
         return False
@@ -114,11 +136,22 @@ def find_email_box(page: Page):
     return None
 
 
+def wait_for_email_box(page: Page, timeout_sec: int = 20):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        box = find_email_box(page)
+        if box is not None:
+            return box
+        time.sleep(1)
+    return None
+
+
 def find_password_box(page: Page):
     locators = [
-        page.get_by_label(re.compile(r"密码|password", re.I)),
         page.locator("input[type='password']"),
         page.locator("input[name*='password' i]"),
+        page.locator("input[autocomplete='current-password'], input[autocomplete='new-password']"),
+        page.get_by_role("textbox", name=re.compile(r"密码|password", re.I)),
     ]
     for loc in locators:
         try:
@@ -165,38 +198,179 @@ def fill_otp(page: Page, otp_code: str) -> bool:
 
 
 def complete_profile(page: Page) -> None:
-    first, last, year, monthday = random_identity()
+    first, last, year, month, day = random_identity()
+    birthday = f"{year}-{month}-{day}"
+    age_value = str(random.randint(22, 34))
     text = visible_text(page)
-    if not any(token in text.lower() for token in ["about", "tell us", "名字", "姓", "birth", "生日", "about you"]):
+    if not any(token in text.lower() for token in ["about", "tell us", "名字", "姓", "birth", "生日", "about you", "年龄", "age"]):
         return
 
-    first_done = maybe_fill(page.get_by_label(re.compile(r"名|first", re.I)), first)
-    last_done = maybe_fill(page.get_by_label(re.compile(r"姓|last", re.I)), last)
+    try:
+        print("[debug] profile inputs=", page.locator("input").evaluate_all(
+            "els => els.map(e => ({type:e.type, name:e.name, placeholder:e.placeholder, aria:e.getAttribute('aria-label'), value:e.value}))"
+        ))
+        print("[debug] profile widgets=", page.locator("input, button, select, [role='combobox'], [role='spinbutton']").evaluate_all(
+            "els => els.map(e => ({tag:e.tagName, type:e.getAttribute('type'), name:e.getAttribute('name'), text:(e.innerText||e.textContent||'').trim().slice(0,80), aria:e.getAttribute('aria-label'), value:e.value||''}))"
+        ))
+        form = page.locator("form")
+        if form.count() > 0:
+            print("[debug] profile form html=", form.first.evaluate("el => el.outerHTML.slice(0, 5000)"))
+    except Exception:
+        pass
+
+    full_name = f"{first} {last}"
+    first_done = maybe_fill(page.get_by_label(re.compile(r"全名|name|名|first", re.I)), full_name)
+    last_done = False
 
     if not first_done:
         txts = page.locator("input[type='text']")
         try:
             if txts.count() >= 1 and txts.nth(0).is_visible():
-                txts.nth(0).fill(first, timeout=3000)
+                txts.nth(0).fill(full_name, timeout=3000)
                 first_done = True
-            if txts.count() >= 2 and txts.nth(1).is_visible():
-                txts.nth(1).fill(last, timeout=3000)
-                last_done = True
         except Exception:
             pass
 
     maybe_fill(page.get_by_label(re.compile(r"年|year", re.I)), year)
-    maybe_fill(page.get_by_label(re.compile(r"生日|birth|date", re.I)), monthday)
+    maybe_fill(page.get_by_label(re.compile(r"月|month", re.I)), month)
+    maybe_fill(page.get_by_label(re.compile(r"日|day", re.I)), day)
+    maybe_fill(page.get_by_label(re.compile(r"年龄|age", re.I)), age_value)
     maybe_fill(page.locator("input[name*='year' i]"), year)
-    maybe_fill(page.locator("input[name*='date' i], input[name*='birth' i]"), monthday)
+    maybe_fill(page.locator("input[name*='month' i]"), month)
+    maybe_fill(page.locator("input[name*='day' i], input[name*='date' i], input[name*='birth' i]"), day)
+    maybe_fill(page.locator("input[name*='age' i]"), age_value)
 
-    click_continue(page)
+    _ = (
+        maybe_type_widget(page, page.locator("[data-type='year']"), year)
+        or maybe_type_widget(page, page.get_by_role("spinbutton", name=re.compile(r"年|year", re.I)), year)
+        or maybe_type_widget(page, page.locator("[aria-label^='年']"), year)
+    )
+    _ = (
+        maybe_type_widget(page, page.locator("[data-type='month']"), month)
+        or maybe_type_widget(page, page.get_by_role("spinbutton", name=re.compile(r"月|month", re.I)), month)
+        or maybe_type_widget(page, page.locator("[aria-label^='月']"), month)
+    )
+    _ = (
+        maybe_type_widget(page, page.locator("[data-type='day']"), day)
+        or maybe_type_widget(page, page.get_by_role("spinbutton", name=re.compile(r"日|day", re.I)), day)
+        or maybe_type_widget(page, page.locator("[aria-label^='日']"), day)
+    )
+    _ = (
+        maybe_type_widget(page, page.get_by_role("spinbutton", name=re.compile(r"年龄|age", re.I)), age_value)
+        or maybe_type_widget(page, page.locator("[aria-label^='年龄']"), age_value)
+    )
+
+    try:
+        selects = page.locator("select")
+        if selects.count() >= 3:
+            selects.nth(0).select_option(year)
+            selects.nth(1).select_option(str(int(month)))
+            selects.nth(2).select_option(str(int(day)))
+            print(f"[debug] birthday selects set to {birthday}")
+    except Exception:
+        pass
+
+    try:
+        page.evaluate(
+            """
+            ({ fullName, birthday, ageValue }) => {
+              const setValue = (el, value) => {
+                if (!el) return;
+                const proto = Object.getPrototypeOf(el);
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) {
+                  desc.set.call(el, value);
+                } else {
+                  el.value = value;
+                }
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              };
+
+              setValue(document.querySelector('input[name="name"]'), fullName);
+              setValue(document.querySelector('input[name="age"]'), ageValue);
+              setValue(document.querySelector('input[name="birthday"]'), birthday);
+              const form = document.querySelector('form');
+              if (form) {
+                form.dispatchEvent(new Event('input', { bubbles: true }));
+                form.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }
+            """,
+            {
+                "fullName": full_name,
+                "birthday": birthday,
+                "ageValue": age_value,
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        birthday_input = page.locator("input[name='birthday']")
+        if birthday_input.count() > 0:
+            birthday_input.evaluate(
+                "(el, value) => { el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }",
+                birthday,
+            )
+            print(f"[debug] birthday set to {birthday}")
+            try:
+                print(f"[debug] birthday current hidden={birthday_input.input_value(timeout=1000)}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        age_input = page.locator("input[name='age']")
+        if age_input.count() > 0:
+            print(f"[debug] age current={age_input.input_value(timeout=1000)}")
+    except Exception:
+        pass
+
+    try:
+        txts = page.locator("input")
+        visible = []
+        for idx in range(txts.count()):
+            item = txts.nth(idx)
+            if item.is_visible():
+                visible.append(item)
+        if len(visible) >= 4:
+            if not first_done:
+                visible[0].fill(full_name, timeout=3000)
+            visible[1].fill(year, timeout=3000)
+            visible[2].fill(month, timeout=3000)
+            visible[3].fill(day, timeout=3000)
+    except Exception:
+        pass
+
+    if not maybe_click(page.get_by_role("button", name=re.compile(r"完成帐户创建|create account|finish", re.I))):
+        click_continue(page)
 
 
 def detect_phone_challenge(page: Page) -> bool:
     text = visible_text(page).lower()
     return any(token in text for token in ["phone", "手机号", "手机号码", "verify your identity", "验证您的身份"]) \
         or "phone" in page.url.lower()
+
+
+def is_email_otp_page(page: Page) -> bool:
+    text = visible_text(page).lower()
+    url = page.url.lower()
+    return (
+        "email-verification" in url
+        or any(
+            token in text
+            for token in [
+                "验证码",
+                "code",
+                "check your inbox",
+                "检查您的收件箱",
+                "输入我们刚刚向",
+                "email verification",
+            ]
+        )
+    )
 
 
 def wait_for_callback(page: Page, redirect_uri: str, timeout_sec: int = 90) -> Optional[str]:
@@ -233,12 +407,23 @@ def perform_auth_flow(
     signup: bool,
 ) -> str:
     page.goto(auth_url, wait_until="domcontentloaded", timeout=120000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    time.sleep(4)
     wait_cloudflare(page, timeout_sec=90)
 
     if signup:
         ensure_signup_page(page)
+        time.sleep(3)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        wait_cloudflare(page, timeout_sec=60)
 
-    email_box = find_email_box(page)
+    email_box = wait_for_email_box(page, timeout_sec=20)
     if not email_box:
         raise FlowError("email input not found")
     email_box.fill(email, timeout=5000)
@@ -257,9 +442,8 @@ def perform_auth_flow(
     wait_cloudflare(page, timeout_sec=60)
 
     otp_code = ""
-    for _ in range(3):
-        text = visible_text(page).lower()
-        if any(token in text for token in ["code", "验证码", "一次性", "email verification", "check your email"]):
+    for _ in range(5):
+        if is_email_otp_page(page):
             otp_code = registrar.get_oai_code(dev_token, email, proxies, seen_msg_ids=set())
             if not otp_code:
                 raise FlowError("email OTP not received")
@@ -268,7 +452,13 @@ def perform_auth_flow(
             click_continue(page)
             time.sleep(3)
             wait_cloudflare(page, timeout_sec=60)
+            if detect_phone_challenge(page):
+                if signup:
+                    raise NeedReauth("phone verification requested")
+                raise FlowError("phone verification still required after reauth")
             continue
+        if "localhost" in page.url and "code=" in page.url:
+            break
         break
 
     complete_profile(page)
@@ -283,22 +473,23 @@ def perform_auth_flow(
     raise FlowError("callback not reached")
 
 
-def launch_context(playwright, *, executable_path: str, headless: bool, artifacts_dir: str) -> BrowserContext:
-    user_data_dir = tempfile.mkdtemp(prefix="pw-openai-", dir=artifacts_dir)
-    context = playwright.chromium.launch_persistent_context(
-        user_data_dir=user_data_dir,
+def launch_context(playwright, *, executable_path: str, headless: bool, artifacts_dir: str) -> tuple[Browser, BrowserContext]:
+    tempfile.mkdtemp(prefix="pw-openai-", dir=artifacts_dir)
+    browser = playwright.chromium.launch(
         executable_path=executable_path or None,
         headless=headless,
-        viewport={"width": 1366, "height": 900},
-        locale="zh-CN",
-        timezone_id="Asia/Tokyo",
-        color_scheme="dark",
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
             "--no-sandbox",
             "--start-maximized",
         ],
+    )
+    context = browser.new_context(
+        viewport={"width": 1366, "height": 900},
+        locale="zh-CN",
+        timezone_id="Asia/Tokyo",
+        color_scheme="dark",
     )
     context.add_init_script(
         """
@@ -308,7 +499,7 @@ def launch_context(playwright, *, executable_path: str, headless: bool, artifact
         window.chrome = window.chrome || { runtime: {} };
         """
     )
-    return context
+    return browser, context
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -404,6 +595,7 @@ def main() -> int:
                 print(f"[*] attempt {attempt}/{args.max_attempts}")
                 started = time.time()
                 email_addr = ""
+                browser = None
                 context = None
                 try:
                     email_addr, dev_token = registrar.get_email_and_token(args.proxy)
@@ -418,7 +610,7 @@ def main() -> int:
                     )
                     print("[*] sub2api generate-auth-url #1 (register)")
 
-                    context = launch_context(
+                    browser, context = launch_context(
                         pw,
                         executable_path=args.chromium_path,
                         headless=args.headless,
@@ -485,6 +677,15 @@ def main() -> int:
                     account_done = True
                     break
                 except Exception as exc:
+                    if context is not None:
+                        try:
+                            page = context.pages[0] if context.pages else None
+                            if page is not None:
+                                print(f"[debug] page_url={page.url}")
+                                print(f"[debug] page_title={page.title()}")
+                                print(f"[debug] page_text={visible_text(page)[:800]}")
+                        except Exception:
+                            pass
                     print(f"[failed] attempt {attempt}: {exc}")
                     append_history(
                         args.history_file,
@@ -503,6 +704,11 @@ def main() -> int:
                     try:
                         if context is not None:
                             context.close()
+                    except Exception:
+                        pass
+                    try:
+                        if browser is not None:
+                            browser.close()
                     except Exception:
                         pass
 
