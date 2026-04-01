@@ -3,6 +3,8 @@ import argparse
 import email
 import getpass
 import json
+import os
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -14,7 +16,7 @@ from playwright.sync_api import sync_playwright
 
 import registrar_core as registrar
 import sub2api_browser_tempmail_registrar as browser_flow
-from sub2api_2925_alias_registrar import AliasStateStore, IMAP2925Client, OTP_REGEX, extract_message_text
+from sub2api_2925_alias_registrar import IMAP2925Client, OTP_REGEX, extract_message_text, now_iso
 from sub2api_browser_tempmail_registrar import FlowError, NeedReauth, SkipMailbox, append_history
 from sub2api_tempmail_registrar import Sub2APIClient, normalize_base_url
 
@@ -26,6 +28,195 @@ def decode_header_str(raw: str) -> str:
         return str(make_header(decode_header(raw)))
     except Exception:
         return str(raw)
+
+
+def parse_domain_list(raw: str) -> list[str]:
+    domains: list[str] = []
+    for part in (raw or "").split(","):
+        domain = part.strip().lower()
+        if not domain:
+            continue
+        if domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+class MultiDomainStateStore:
+    def __init__(
+        self,
+        *,
+        state_path: str,
+        history_path: str,
+        local_prefix: str,
+        domains: list[str],
+        start_index: int,
+    ) -> None:
+        if not domains:
+            raise ValueError("at least one domain is required")
+        self.state_path = state_path
+        self.history_path = history_path
+        self.local_prefix = local_prefix
+        self.domains = domains
+        self.start_index = start_index
+        self._lock = threading.Lock()
+        self._ensure_state()
+
+    def _default_domain_state(self, domain: str) -> dict[str, Any]:
+        return {
+            "domain": domain,
+            "next_index": self.start_index,
+            "cooldown_until": 0.0,
+            "last_allocated": None,
+        }
+
+    def _default_state(self) -> dict[str, Any]:
+        return {
+            "version": 2,
+            "local_prefix": self.local_prefix,
+            "domain_order": self.domains,
+            "next_domain_cursor": 0,
+            "domains": {domain: self._default_domain_state(domain) for domain in self.domains},
+            "updated_at": now_iso(),
+        }
+
+    def _append_history(self, row: dict[str, Any]) -> None:
+        os.makedirs(os.path.dirname(self.history_path) or ".", exist_ok=True)
+        with open(self.history_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False))
+            f.write("\n")
+
+    def _save_state(self, data: dict[str, Any]) -> None:
+        data["updated_at"] = now_iso()
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.state_path)
+
+    def _load_state(self) -> dict[str, Any]:
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return self._default_state()
+            return data
+        except Exception:
+            return self._default_state()
+
+    def _migrate_state(self, existing: dict[str, Any]) -> dict[str, Any]:
+        migrated = self._default_state()
+        version = int(existing.get("version") or 1)
+        if version == 1:
+            old_domain = str(existing.get("domain") or "").strip().lower()
+            if old_domain in migrated["domains"]:
+                migrated["domains"][old_domain]["next_index"] = int(existing.get("next_index") or self.start_index)
+                migrated["domains"][old_domain]["last_allocated"] = existing.get("last_allocated")
+            return migrated
+
+        stored_domains = existing.get("domains") or {}
+        if isinstance(stored_domains, dict):
+            for domain in self.domains:
+                current = migrated["domains"][domain]
+                prev = stored_domains.get(domain) or {}
+                if isinstance(prev, dict):
+                    try:
+                        current["next_index"] = max(self.start_index, int(prev.get("next_index") or self.start_index))
+                    except Exception:
+                        pass
+                    try:
+                        current["cooldown_until"] = float(prev.get("cooldown_until") or 0.0)
+                    except Exception:
+                        pass
+                    current["last_allocated"] = prev.get("last_allocated")
+        cursor = int(existing.get("next_domain_cursor") or 0)
+        if self.domains:
+            migrated["next_domain_cursor"] = cursor % len(self.domains)
+        return migrated
+
+    def _ensure_state(self) -> None:
+        os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+        if not os.path.exists(self.state_path):
+            self._save_state(self._default_state())
+            return
+        current = self._load_state()
+        migrated = self._migrate_state(current)
+        self._save_state(migrated)
+
+    def allocate_next_alias(self) -> tuple[str, str, int]:
+        with self._lock:
+            state = self._migrate_state(self._load_state())
+            now_ts = time.time()
+            order = state["domain_order"]
+            cursor = int(state.get("next_domain_cursor") or 0) % len(order)
+
+            chosen_domain = ""
+            for offset in range(len(order)):
+                domain = order[(cursor + offset) % len(order)]
+                domain_state = state["domains"][domain]
+                if float(domain_state.get("cooldown_until") or 0.0) <= now_ts:
+                    chosen_domain = domain
+                    state["next_domain_cursor"] = (cursor + offset + 1) % len(order)
+                    break
+
+            if not chosen_domain:
+                earliest_domain = min(order, key=lambda d: float(state["domains"][d].get("cooldown_until") or 0.0))
+                wait_seconds = max(0.0, float(state["domains"][earliest_domain].get("cooldown_until") or 0.0) - now_ts)
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                chosen_domain = earliest_domain
+                state["next_domain_cursor"] = (order.index(earliest_domain) + 1) % len(order)
+
+            domain_state = state["domains"][chosen_domain]
+            next_index = int(domain_state.get("next_index") or self.start_index)
+            if next_index < self.start_index:
+                next_index = self.start_index
+            email_addr = f"{self.local_prefix}{next_index}@{chosen_domain}"
+            domain_state["next_index"] = next_index + 1
+            domain_state["last_allocated"] = {"email": email_addr, "index": next_index, "at": now_iso()}
+            self._save_state(state)
+            self._append_history(
+                {
+                    "at": now_iso(),
+                    "event": "allocated",
+                    "domain": chosen_domain,
+                    "email": email_addr,
+                    "index": next_index,
+                }
+            )
+            return email_addr, chosen_domain, next_index
+
+    def mark_domain_cooldown(self, domain: str, seconds: float, *, reason: str) -> None:
+        if not domain:
+            return
+        with self._lock:
+            state = self._migrate_state(self._load_state())
+            domain_state = state["domains"].get(domain)
+            if not isinstance(domain_state, dict):
+                return
+            domain_state["cooldown_until"] = max(float(domain_state.get("cooldown_until") or 0.0), time.time() + max(0.0, seconds))
+            self._save_state(state)
+            self._append_history(
+                {
+                    "at": now_iso(),
+                    "event": "cooldown",
+                    "domain": domain,
+                    "seconds": seconds,
+                    "reason": reason,
+                }
+            )
+
+    def record_result(self, *, email_addr: str, success: bool, detail: dict[str, Any]) -> None:
+        domain = email_addr.split("@", 1)[1].lower() if "@" in email_addr else ""
+        with self._lock:
+            self._append_history(
+                {
+                    "at": now_iso(),
+                    "event": "result",
+                    "domain": domain,
+                    "email": email_addr,
+                    "success": success,
+                    "detail": detail,
+                }
+            )
 
 
 class RoutingIMAPClient(IMAP2925Client):
@@ -91,7 +282,7 @@ class RoutingIMAPClient(IMAP2925Client):
 
 def install_domain_mail_bridge(
     *,
-    state_store: AliasStateStore,
+    state_store: MultiDomainStateStore,
     imap_client: RoutingIMAPClient,
     otp_timeout: int,
     otp_poll_interval: float,
@@ -110,10 +301,10 @@ def install_domain_mail_bridge(
 
     def patched_get_email_and_token(proxies: Any = None) -> tuple[str, str]:
         del proxies
-        email_addr, idx = state_store.allocate_next_alias()
+        email_addr, domain_name, idx = state_store.allocate_next_alias()
         baseline_uid = imap_client.latest_uid()
         token = f"domain:{baseline_uid}:{email_addr}"
-        print(f"[*] domain mailbox: {email_addr} (baseline_uid={baseline_uid})")
+        print(f"[*] domain mailbox: {email_addr} [{domain_name}] (baseline_uid={baseline_uid})")
         return email_addr, token
 
     def patched_get_oai_code(
@@ -173,6 +364,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-sleep", type=float, default=2.0, help="Sleep seconds between failed attempts")
     parser.add_argument("--sleep", type=float, default=90.0, help="Sleep seconds between accounts")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of stopping after count accounts")
+    parser.add_argument("--phone-risk-threshold", type=int, default=3, help="Consecutive phone-risk failures before long cooldown")
+    parser.add_argument("--phone-risk-cooldown", type=float, default=900.0, help="Cooldown seconds after repeated phone-risk failures")
     parser.add_argument("--history-file", default="", help="Optional JSONL run history file")
     parser.add_argument("--chromium-path", default="", help="Optional Chromium executable path")
     parser.add_argument("--headless", action="store_true", help="Launch Chromium in headless mode")
@@ -180,11 +373,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     parser.add_argument("--telegram-bot-token", default="", help="Optional Telegram bot token for notifications")
     parser.add_argument("--telegram-chat-id", default="", help="Optional Telegram chat id; auto-detected from getUpdates if empty")
-    parser.add_argument("--mail-domain", default="xingyunfan.dpdns.org", help="Custom domain used for signup addresses")
+    parser.add_argument("--mail-domain", default="xingyunfan.dpdns.org", help="Single custom domain used for signup addresses")
+    parser.add_argument("--mail-domains", default="", help="Comma-separated signup domains for round-robin use")
     parser.add_argument("--mail-local-prefix", default="oc", help="Sequential local-part prefix")
     parser.add_argument("--start-index", type=int, default=1, help="Sequential alias start index")
     parser.add_argument("--state-file", default="domain_alias_state.json", help="Alias state file path")
     parser.add_argument("--alias-history-file", default="domain_alias_history.jsonl", help="Alias allocation history file path")
+    parser.add_argument("--domain-failure-cooldown", type=float, default=120.0, help="Cooldown seconds for a domain after a failed attempt")
     parser.add_argument("--imap-host", default="imap.2925.com", help="IMAP host")
     parser.add_argument("--imap-port", type=int, default=993, help="IMAP port")
     parser.add_argument("--imap-user", default="yunfanxing6@2925.com", help="IMAP username")
@@ -297,12 +492,17 @@ def main() -> int:
 
     try:
         sub2api_url = normalize_base_url(args.sub2api_url)
+        signup_domains = parse_domain_list(args.mail_domains) if args.mail_domains.strip() else parse_domain_list(args.mail_domain)
+        if not signup_domains:
+            raise ValueError("at least one signup domain is required")
         if not args.admin_api_key and not args.admin_token and not args.admin_email:
             raise ValueError("provide --admin-api-key or --admin-token or --admin-email")
         if args.count <= 0 or args.max_attempts <= 0:
             raise ValueError("count/max-attempts must be > 0")
         if args.otp_timeout <= 0 or args.otp_poll <= 0:
             raise ValueError("otp timeout/poll must be > 0")
+        if args.domain_failure_cooldown < 0:
+            raise ValueError("domain-failure-cooldown must be >= 0")
     except Exception as exc:
         print(f"[config error] {exc}")
         return 2
@@ -317,11 +517,11 @@ def main() -> int:
     artifacts_dir = Path(args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    state_store = AliasStateStore(
+    state_store = MultiDomainStateStore(
         state_path=args.state_file,
         history_path=args.alias_history_file,
         local_prefix=args.mail_local_prefix,
-        domain=args.mail_domain,
+        domains=signup_domains,
         start_index=args.start_index,
     )
     imap_client = RoutingIMAPClient(
@@ -352,13 +552,14 @@ def main() -> int:
     notifier = TelegramNotifier(args.telegram_bot_token, args.telegram_chat_id)
 
     print("[Info] browser domain-mail + Sub2API registrar started")
-    print(f"[Info] signup domain: {args.mail_domain}")
+    print(f"[Info] signup domains: {', '.join(signup_domains)}")
     print(f"[Info] imap inbox: {args.imap_user}")
 
     success = 0
     failed_accounts = 0
     total_attempts = 0
     skipped_mailboxes = 0
+    consecutive_phone_risk = 0
 
     def print_stats() -> None:
         processed = success + failed_accounts
@@ -377,6 +578,8 @@ def main() -> int:
                 break
             print(f"\n========== account {idx}/{args.count} ==========")
             account_done = False
+            account_force_cooldown = False
+            account_last_reason = ""
             for attempt in range(1, args.max_attempts + 1):
                 total_attempts += 1
                 print(f"[*] attempt {attempt}/{args.max_attempts}")
@@ -458,7 +661,6 @@ def main() -> int:
                     print(f"[OK] account created: id={created.get('id')}, name={created.get('name')}")
                     state_store.record_result(
                         email_addr=email_addr,
-                        index=None,
                         success=True,
                         detail={
                             "attempt": attempt,
@@ -480,6 +682,7 @@ def main() -> int:
                     )
                     success += 1
                     account_done = True
+                    consecutive_phone_risk = 0
                     try:
                         notifier.send(f"sub2api success\naccount={created.get('name')}\nid={created.get('id')}\nsuccess={success}")
                     except Exception:
@@ -500,6 +703,7 @@ def main() -> int:
                     break
                 except Exception as exc:
                     reason = str(exc)
+                    account_last_reason = reason
                     if context is not None:
                         try:
                             page = context.pages[0] if context.pages else None
@@ -514,9 +718,26 @@ def main() -> int:
                         print(f"[skip] attempt {attempt}: {reason}; switching to next domain mailbox")
                     else:
                         print(f"[failed] attempt {attempt}: {reason}")
+
+                    if reason == "phone verification still required after reauth":
+                        consecutive_phone_risk += 1
+                        if args.phone_risk_threshold > 0 and args.phone_risk_cooldown > 0 and consecutive_phone_risk >= args.phone_risk_threshold:
+                            account_force_cooldown = True
+                            print(
+                                f"[warn] phone-risk streak={consecutive_phone_risk}, cooling down for {int(args.phone_risk_cooldown)}s"
+                            )
+                    else:
+                        consecutive_phone_risk = 0
+
+                    failed_domain = email_addr.split("@", 1)[1].lower() if "@" in email_addr else ""
+                    state_store.mark_domain_cooldown(
+                        failed_domain,
+                        args.domain_failure_cooldown,
+                        reason=reason,
+                    )
+
                     state_store.record_result(
                         email_addr=email_addr,
-                        index=None,
                         success=False,
                         detail={
                             "attempt": attempt,
@@ -538,6 +759,8 @@ def main() -> int:
                             "elapsed_sec": round(time.time() - started, 2),
                         },
                     )
+                    if account_force_cooldown:
+                        break
                     if attempt < args.max_attempts and args.retry_sleep > 0:
                         time.sleep(args.retry_sleep)
                 finally:
@@ -556,7 +779,9 @@ def main() -> int:
                 print(f"[failed] account {idx} exhausted {args.max_attempts} attempts")
                 failed_accounts += 1
                 try:
-                    notifier.send(f"sub2api failed\naccount_index={idx}\nfailed_after_attempts={args.max_attempts}")
+                    notifier.send(
+                        f"sub2api failed\naccount_index={idx}\nfailed_after_attempts={args.max_attempts}\nreason={account_last_reason or 'unknown'}"
+                    )
                 except Exception:
                     pass
                 append_history(
@@ -567,11 +792,13 @@ def main() -> int:
                         "success": False,
                         "account_index": idx,
                         "attempts_used": args.max_attempts,
+                        "reason": account_last_reason,
                     },
                 )
                 print_stats()
-            if (args.loop or idx < args.count) and args.sleep > 0:
-                time.sleep(args.sleep)
+            sleep_seconds = args.phone_risk_cooldown if account_force_cooldown else args.sleep
+            if (args.loop or idx < args.count) and sleep_seconds > 0:
+                time.sleep(sleep_seconds)
 
     total_accounts = success + failed_accounts
     print(f"\nDone: success {success}/{total_accounts or args.count}")

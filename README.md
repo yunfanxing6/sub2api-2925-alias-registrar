@@ -67,14 +67,15 @@ Custom-domain mailbox version:
 xvfb-run -a python3 sub2api_browser_domain_registrar.py \
   --sub2api-url "http://127.0.0.1:8080" \
   --admin-api-key "YOUR_ADMIN_API_KEY" \
-  --mail-domain "xingyunfan.dpdns.org" \
+  --mail-domains "xingyunfan.dpdns.org,yunfanxing.dpdns.org,openaiapi.icu" \
   --group-ids "all" \
   --imap-host "imap.2925.com" \
   --imap-port 993 \
   --imap-user "yunfanxing6@2925.com" \
   --imap-password "YOUR_IMAP_PASSWORD" \
   --count 1 \
-  --max-attempts 5
+  --max-attempts 1 \
+  --domain-failure-cooldown 120
 ```
 
 Loop one registration every 60 seconds:
@@ -83,7 +84,7 @@ Loop one registration every 60 seconds:
 xvfb-run -a python3 sub2api_browser_domain_registrar.py \
   --sub2api-url "http://127.0.0.1:8080" \
   --admin-api-key "YOUR_ADMIN_API_KEY" \
-  --mail-domain "xingyunfan.dpdns.org" \
+  --mail-domains "xingyunfan.dpdns.org,yunfanxing.dpdns.org,openaiapi.icu" \
   --group-ids "all" \
   --imap-host "imap.2925.com" \
   --imap-port 993 \
@@ -91,7 +92,8 @@ xvfb-run -a python3 sub2api_browser_domain_registrar.py \
   --imap-password "YOUR_IMAP_PASSWORD" \
   --loop \
   --sleep 90 \
-  --max-attempts 5
+  --max-attempts 1 \
+  --domain-failure-cooldown 120
 ```
 
 History stats:
@@ -109,6 +111,8 @@ Systemd templates:
 Notes:
 
 - The service defaults to one account every `90` seconds.
+- Failed domains are cooled down for `120` seconds before reuse.
+- The production setup can rotate across multiple domains via `--mail-domains`.
 - Telegram notifications are supported via `TELEGRAM_BOT_TOKEN` and optional `TELEGRAM_CHAT_ID` in the env file. If `TELEGRAM_CHAT_ID` is empty, the script tries to auto-discover it from `getUpdates` after you send a message to the bot.
 
 ## VPS one-liner
