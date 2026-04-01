@@ -68,6 +68,7 @@ xvfb-run -a python3 sub2api_browser_domain_registrar.py \
   --sub2api-url "http://127.0.0.1:8080" \
   --admin-api-key "YOUR_ADMIN_API_KEY" \
   --mail-domain "xingyunfan.dpdns.org" \
+  --group-ids "all" \
   --imap-host "imap.2925.com" \
   --imap-port 993 \
   --imap-user "yunfanxing6@2925.com" \
@@ -83,12 +84,13 @@ xvfb-run -a python3 sub2api_browser_domain_registrar.py \
   --sub2api-url "http://127.0.0.1:8080" \
   --admin-api-key "YOUR_ADMIN_API_KEY" \
   --mail-domain "xingyunfan.dpdns.org" \
+  --group-ids "all" \
   --imap-host "imap.2925.com" \
   --imap-port 993 \
   --imap-user "yunfanxing6@2925.com" \
   --imap-password "YOUR_IMAP_PASSWORD" \
   --loop \
-  --sleep 60 \
+  --sleep 90 \
   --max-attempts 5
 ```
 
@@ -103,6 +105,11 @@ Systemd templates:
 - `deploy/sub2api-browser-domain-registrar.service`
 - `deploy/sub2api-browser-domain-registrar.env.example`
 - `deploy/sub2api-browser-domain-registrar.logrotate`
+
+Notes:
+
+- The service defaults to one account every `90` seconds.
+- Telegram notifications are supported via `TELEGRAM_BOT_TOKEN` and optional `TELEGRAM_CHAT_ID` in the env file. If `TELEGRAM_CHAT_ID` is empty, the script tries to auto-discover it from `getUpdates` after you send a message to the bot.
 
 ## VPS one-liner
 

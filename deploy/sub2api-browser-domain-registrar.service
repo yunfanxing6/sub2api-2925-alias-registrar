@@ -10,7 +10,7 @@ WorkingDirectory=/root/sub2api-2925-alias-registrar
 ExecStart=/root/sub2api-2925-alias-registrar/run_sub2api_browser_domain_registrar.sh
 Restart=always
 RestartSec=15
-KillMode=process
+KillMode=control-group
 StandardOutput=append:/var/log/sub2api-browser-domain-registrar.log
 StandardError=append:/var/log/sub2api-browser-domain-registrar.log
 

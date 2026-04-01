@@ -19,6 +19,7 @@ import registrar_core as registrar
 
 
 OTP_REGEX = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+UID_REGEX = re.compile(rb"UID\s+(\d+)")
 
 
 def now_iso() -> str:
@@ -218,14 +219,37 @@ class IMAP2925Client:
         conn.select(self.folder, readonly=True)
         return conn
 
+    def _select_count(self, conn: imaplib.IMAP4_SSL) -> int:
+        typ, data = conn.select(self.folder, readonly=True)
+        if typ != "OK" or not data or not data[0]:
+            return 0
+        return int(data[0])
+
+    def _fetch_uid_rfc822(self, conn: imaplib.IMAP4_SSL, seq: int) -> tuple[int, bytes]:
+        typ, fetch_data = conn.fetch(str(seq), "(UID RFC822)")
+        if typ != "OK" or not fetch_data:
+            return 0, b""
+        uid = 0
+        raw_email = b""
+        for item in fetch_data:
+            if isinstance(item, tuple):
+                header = item[0] if isinstance(item[0], (bytes, bytearray)) else b""
+                m = UID_REGEX.search(bytes(header))
+                if m:
+                    uid = int(m.group(1))
+                if len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
+                    raw_email = bytes(item[1])
+        return uid, raw_email
+
     def latest_uid(self) -> int:
         conn = None
         try:
             conn = self._connect()
-            typ, data = conn.select(self.folder, readonly=True)
-            if typ != "OK" or not data or not data[0]:
+            count = self._select_count(conn)
+            if count <= 0:
                 return 0
-            return int(data[0])
+            uid, _ = self._fetch_uid_rfc822(conn, count)
+            return uid
         except Exception:
             return 0
         finally:
@@ -252,33 +276,21 @@ class IMAP2925Client:
             conn = None
             try:
                 conn = self._connect()
-                typ, data = conn.select(self.folder, readonly=True)
-                if typ != "OK" or not data or not data[0]:
+                latest_seq = self._select_count(conn)
+                if latest_seq <= 0:
                     time.sleep(poll_interval_sec)
                     continue
 
-                latest_msg_id = int(data[0])
-                if latest_msg_id <= 0:
-                    time.sleep(poll_interval_sec)
-                    continue
-
-                start_msg_id = max(1, since_uid + 1, latest_msg_id - 119)
-                for msg_id in range(latest_msg_id, start_msg_id - 1, -1):
-                    if msg_id <= since_uid:
+                start_seq = max(1, latest_seq - 119)
+                for seq in range(latest_seq, start_seq - 1, -1):
+                    uid, raw_email = self._fetch_uid_rfc822(conn, seq)
+                    if uid <= 0:
                         continue
-                    if msg_id in seen_uids:
+                    if uid <= since_uid:
                         continue
-
-                    typ_fetch, fetch_data = conn.fetch(str(msg_id), "(RFC822)")
-                    seen_uids.add(msg_id)
-                    if typ_fetch != "OK" or not fetch_data:
+                    if uid in seen_uids:
                         continue
-
-                    raw_email = b""
-                    for item in fetch_data:
-                        if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
-                            raw_email = bytes(item[1])
-                            break
+                    seen_uids.add(uid)
                     if not raw_email:
                         continue
 
@@ -302,7 +314,7 @@ class IMAP2925Client:
 
                     m = OTP_REGEX.search("\n".join([subject, body]))
                     if m:
-                        return m.group(1), msg_id
+                        return m.group(1), uid
 
             except Exception:
                 pass

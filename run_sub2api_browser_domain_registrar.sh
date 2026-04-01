@@ -20,7 +20,7 @@ args=(
   --count "${COUNT:-1}"
   --max-attempts "${MAX_ATTEMPTS:-5}"
   --retry-sleep "${RETRY_SLEEP:-1}"
-  --sleep "${SLEEP_SECONDS:-60}"
+  --sleep "${SLEEP_SECONDS:-90}"
   --history-file "${HISTORY_FILE:-$REPO_DIR/domain_history_service.jsonl}"
   --state-file "${STATE_FILE:-$REPO_DIR/domain_alias_state.json}"
   --alias-history-file "${ALIAS_HISTORY_FILE:-$REPO_DIR/domain_alias_allocations.jsonl}"
@@ -46,6 +46,18 @@ fi
 
 if [[ -n "${CHROMIUM_PATH:-}" ]]; then
   args+=(--chromium-path "$CHROMIUM_PATH")
+fi
+
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  args+=(--telegram-bot-token "$TELEGRAM_BOT_TOKEN")
+fi
+
+if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+  args+=(--telegram-chat-id "$TELEGRAM_CHAT_ID")
+fi
+
+if [[ "${DEBUG:-0}" == "1" ]]; then
+  args+=(--debug)
 fi
 
 if [[ "${HEADLESS:-0}" == "1" ]]; then

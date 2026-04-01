@@ -15,6 +15,14 @@ import registrar_core as registrar
 from sub2api_tempmail_registrar import Sub2APIClient, normalize_base_url, parse_group_ids, parse_mail_sources
 
 
+DEBUG_LOGS = False
+
+
+def debug_log(*parts: object) -> None:
+    if DEBUG_LOGS:
+        print(*parts)
+
+
 def random_identity() -> tuple[str, str, str, str, str]:
     first_names = ["James", "Mary", "John", "Emma", "Robert", "Sarah", "David", "Laura", "Michael", "Anna"]
     last_names = ["Smith", "Brown", "Wilson", "Taylor", "Clark", "Hall", "Lewis", "Young", "King", "Green"]
@@ -219,9 +227,51 @@ def fill_otp(page: Page, otp_code: str) -> bool:
     for loc in [
         page.get_by_role("textbox", name=re.compile(r"代码|code|验证码", re.I)),
         page.locator("input[inputmode='numeric']"),
+        page.locator("input[type='text']"),
+        page.locator("[contenteditable='true']"),
     ]:
         if maybe_fill(loc, otp_code):
             return True
+
+    try:
+        page.locator("body").click(timeout=2000)
+        page.keyboard.type(otp_code, delay=50)
+        return True
+    except Exception:
+        pass
+
+    try:
+        page.evaluate(
+            """
+            (value) => {
+              const candidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
+              for (const el of candidates) {
+                if (!(el instanceof HTMLElement)) continue
+                const style = window.getComputedStyle(el)
+                if (style.display === 'none' || style.visibility === 'hidden') continue
+                if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+                  el.focus()
+                  el.value = value
+                  el.dispatchEvent(new Event('input', { bubbles: true }))
+                  el.dispatchEvent(new Event('change', { bubbles: true }))
+                  return true
+                }
+                if (el.isContentEditable) {
+                  el.focus()
+                  el.textContent = value
+                  el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }))
+                  el.dispatchEvent(new Event('change', { bubbles: true }))
+                  return true
+                }
+              }
+              return false
+            }
+            """,
+            otp_code,
+        )
+        return True
+    except Exception:
+        pass
     return False
 
 
@@ -234,15 +284,15 @@ def complete_profile(page: Page) -> None:
         return
 
     try:
-        print("[debug] profile inputs=", page.locator("input").evaluate_all(
+        debug_log("[debug] profile inputs=", page.locator("input").evaluate_all(
             "els => els.map(e => ({type:e.type, name:e.name, placeholder:e.placeholder, aria:e.getAttribute('aria-label'), value:e.value}))"
         ))
-        print("[debug] profile widgets=", page.locator("input, button, select, [role='combobox'], [role='spinbutton']").evaluate_all(
+        debug_log("[debug] profile widgets=", page.locator("input, button, select, [role='combobox'], [role='spinbutton']").evaluate_all(
             "els => els.map(e => ({tag:e.tagName, type:e.getAttribute('type'), name:e.getAttribute('name'), text:(e.innerText||e.textContent||'').trim().slice(0,80), aria:e.getAttribute('aria-label'), value:e.value||''}))"
         ))
         form = page.locator("form")
         if form.count() > 0:
-            print("[debug] profile form html=", form.first.evaluate("el => el.outerHTML.slice(0, 5000)"))
+            debug_log("[debug] profile form html=", form.first.evaluate("el => el.outerHTML.slice(0, 5000)"))
     except Exception:
         pass
 
@@ -294,7 +344,7 @@ def complete_profile(page: Page) -> None:
             selects.nth(0).select_option(year)
             selects.nth(1).select_option(str(int(month)))
             selects.nth(2).select_option(str(int(day)))
-            print(f"[debug] birthday selects set to {birthday}")
+            debug_log(f"[debug] birthday selects set to {birthday}")
     except Exception:
         pass
 
@@ -341,9 +391,9 @@ def complete_profile(page: Page) -> None:
                 "(el, value) => { el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }",
                 birthday,
             )
-            print(f"[debug] birthday set to {birthday}")
+            debug_log(f"[debug] birthday set to {birthday}")
             try:
-                print(f"[debug] birthday current hidden={birthday_input.input_value(timeout=1000)}")
+                debug_log(f"[debug] birthday current hidden={birthday_input.input_value(timeout=1000)}")
             except Exception:
                 pass
     except Exception:
@@ -352,7 +402,7 @@ def complete_profile(page: Page) -> None:
     try:
         age_input = page.locator("input[name='age']")
         if age_input.count() > 0:
-            print(f"[debug] age current={age_input.input_value(timeout=1000)}")
+            debug_log(f"[debug] age current={age_input.input_value(timeout=1000)}")
     except Exception:
         pass
 
@@ -416,6 +466,12 @@ def is_codex_consent_page(page: Page) -> bool:
         or "登录到 codex" in text
         or "chatgpt 将向 codex 提供" in text
         or "sign in to codex" in text
+    )
+
+
+def maybe_click_resend_email(page: Page) -> bool:
+    return maybe_click(page.get_by_role("button", name=re.compile(r"重新发送|resend", re.I))) or maybe_click(
+        page.get_by_role("link", name=re.compile(r"重新发送|resend", re.I))
     )
 
 
@@ -511,10 +567,16 @@ def perform_auth_flow(
     wait_cloudflare(page, timeout_sec=60)
 
     otp_code = ""
-    for _ in range(5):
+    otp_wait_rounds = 0
+    for _ in range(7):
         if is_email_otp_page(page):
             otp_code = registrar.get_oai_code(dev_token, email, proxies, seen_msg_ids=set())
             if not otp_code:
+                otp_wait_rounds += 1
+                if otp_wait_rounds <= 2 and maybe_click_resend_email(page):
+                    print(f"[warn] otp not received yet, requested resend ({otp_wait_rounds}/2)")
+                    time.sleep(8)
+                    continue
                 raise FlowError("email OTP not received")
             if not fill_otp(page, otp_code):
                 raise FlowError("otp input not found")
@@ -605,6 +667,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chromium-path", default="", help="Optional Chromium executable path")
     parser.add_argument("--headless", action="store_true", help="Launch Chromium in headless mode")
     parser.add_argument("--artifacts-dir", default="artifacts", help="Directory for browser profiles and screenshots")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     return parser
 
 
@@ -619,6 +682,9 @@ def append_history(path: str, row: dict[str, Any]) -> None:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    global DEBUG_LOGS
+    DEBUG_LOGS = bool(args.debug)
 
     try:
         sub2api_url = normalize_base_url(args.sub2api_url)
@@ -756,9 +822,9 @@ def main() -> int:
                         try:
                             page = context.pages[0] if context.pages else None
                             if page is not None:
-                                print(f"[debug] page_url={page.url}")
-                                print(f"[debug] page_title={page.title()}")
-                                print(f"[debug] page_text={visible_text(page)[:800]}")
+                                debug_log(f"[debug] page_url={page.url}")
+                                debug_log(f"[debug] page_title={page.title()}")
+                                debug_log(f"[debug] page_text={visible_text(page)[:800]}")
                         except Exception:
                             pass
                     reason = str(exc)

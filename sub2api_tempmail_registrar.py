@@ -7,7 +7,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import registrar_core as registrar
 
@@ -181,6 +181,28 @@ class Sub2APIClient:
             raise RuntimeError(self._error_text(status, body))
         return self._data(body)
 
+    def _request_admin_any(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        headers = self._auth_headers()
+        status, body = self._http_json(method, path, payload=payload, headers=headers)
+
+        if (
+            status == 401
+            and not self.admin_api_key
+            and not self.admin_token
+            and self.admin_email
+            and self.admin_password
+        ):
+            with self._lock:
+                self._jwt = self._login_jwt()
+                headers = {"Authorization": f"Bearer {self._jwt}"}
+            status, body = self._http_json(method, path, payload=payload, headers=headers)
+
+        if status != 200 or not self._ok(body):
+            raise RuntimeError(self._error_text(status, body))
+
+        data = body.get("data") if isinstance(body, dict) else None
+        return data
+
     def generate_auth_url(self, *, redirect_uri: str, proxy_id: Optional[int]) -> Tuple[str, str]:
         payload: Dict[str, Any] = {"redirect_uri": redirect_uri}
         if proxy_id is not None:
@@ -220,6 +242,26 @@ class Sub2APIClient:
         if group_ids:
             payload["group_ids"] = group_ids
         return self._request_admin("POST", "/api/v1/admin/openai/create-from-oauth", payload)
+
+    def list_groups_all(self, *, platform: str = "") -> List[Dict[str, Any]]:
+        path = "/api/v1/admin/groups/all"
+        if platform.strip():
+            from urllib.parse import quote_plus
+            path += f"?platform={quote_plus(platform.strip())}"
+        data = self._request_admin_any("GET", path)
+        return data if isinstance(data, list) else []
+
+    def get_account(self, account_id: int) -> Dict[str, Any]:
+        data = self._request_admin_any("GET", f"/api/v1/admin/accounts/{int(account_id)}")
+        return data if isinstance(data, dict) else {}
+
+    def get_available_models(self, account_id: int) -> List[Dict[str, Any]]:
+        data = self._request_admin_any("GET", f"/api/v1/admin/accounts/{int(account_id)}/models")
+        return data if isinstance(data, list) else []
+
+    def update_account(self, account_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._request_admin_any("PUT", f"/api/v1/admin/accounts/{int(account_id)}", updates)
+        return data if isinstance(data, dict) else {}
 
 
 def install_sub2api_bridge(
