@@ -4,6 +4,8 @@ import email
 import getpass
 import json
 import os
+import random
+import string
 import threading
 import time
 import urllib.parse
@@ -75,6 +77,7 @@ class MultiDomainStateStore:
             "local_prefix": self.local_prefix,
             "domain_order": self.domains,
             "next_domain_cursor": 0,
+            "used_local_parts": [],
             "domains": {domain: self._default_domain_state(domain) for domain in self.domains},
             "updated_at": now_iso(),
         }
@@ -130,7 +133,19 @@ class MultiDomainStateStore:
         cursor = int(existing.get("next_domain_cursor") or 0)
         if self.domains:
             migrated["next_domain_cursor"] = cursor % len(self.domains)
+        used_local_parts = existing.get("used_local_parts") or []
+        if isinstance(used_local_parts, list):
+            migrated["used_local_parts"] = [str(x) for x in used_local_parts if str(x).strip()]
         return migrated
+
+    def _generate_unique_local_part(self, state: dict[str, Any]) -> str:
+        used = set(str(x) for x in state.get("used_local_parts") or [])
+        alphabet = string.ascii_lowercase + string.digits
+        for _ in range(5000):
+            candidate = "".join(random.choice(alphabet) for _ in range(5))
+            if candidate not in used:
+                return candidate
+        raise RuntimeError("failed to generate unique local part")
 
     def _ensure_state(self) -> None:
         os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
@@ -169,9 +184,11 @@ class MultiDomainStateStore:
             next_index = int(domain_state.get("next_index") or self.start_index)
             if next_index < self.start_index:
                 next_index = self.start_index
-            email_addr = f"{self.local_prefix}{next_index}@{chosen_domain}"
+            local_part = self._generate_unique_local_part(state)
+            email_addr = f"{local_part}@{chosen_domain}"
+            state.setdefault("used_local_parts", []).append(local_part)
             domain_state["next_index"] = next_index + 1
-            domain_state["last_allocated"] = {"email": email_addr, "index": next_index, "at": now_iso()}
+            domain_state["last_allocated"] = {"email": email_addr, "index": next_index, "local_part": local_part, "at": now_iso()}
             self._save_state(state)
             self._append_history(
                 {
@@ -179,6 +196,7 @@ class MultiDomainStateStore:
                     "event": "allocated",
                     "domain": chosen_domain,
                     "email": email_addr,
+                    "local_part": local_part,
                     "index": next_index,
                 }
             )
