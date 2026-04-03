@@ -391,6 +391,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     parser.add_argument("--telegram-bot-token", default="", help="Optional Telegram bot token for notifications")
     parser.add_argument("--telegram-chat-id", default="", help="Optional Telegram chat id; auto-detected from getUpdates if empty")
+    parser.add_argument("--telegram-chat-cache-file", default="telegram_chat_id.txt", help="File used to persist resolved Telegram chat id")
     parser.add_argument("--mail-domain", default="xingyunfan.dpdns.org", help="Single custom domain used for signup addresses")
     parser.add_argument("--mail-domains", default="", help="Comma-separated signup domains for round-robin use")
     parser.add_argument("--mail-local-prefix", default="oc", help="Sequential local-part prefix")
@@ -410,9 +411,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 class TelegramNotifier:
-    def __init__(self, bot_token: str, chat_id: str) -> None:
+    def __init__(self, bot_token: str, chat_id: str, cache_file: str) -> None:
         self.bot_token = (bot_token or "").strip()
         self.chat_id = (chat_id or "").strip()
+        self.cache_file = (cache_file or "").strip()
+        if not self.chat_id and self.cache_file:
+            try:
+                self.chat_id = Path(self.cache_file).read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
 
     def _api_url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.bot_token}/{method}"
@@ -428,6 +435,11 @@ class TelegramNotifier:
             chat_id = str(chat.get("id") or "").strip()
             if chat_id:
                 self.chat_id = chat_id
+                if self.cache_file:
+                    try:
+                        Path(self.cache_file).write_text(chat_id, encoding="utf-8")
+                    except Exception:
+                        pass
                 return chat_id
         return ""
 
@@ -567,7 +579,7 @@ def main() -> int:
         admin_password=admin_password,
         login_turnstile_token=args.login_turnstile_token,
     )
-    notifier = TelegramNotifier(args.telegram_bot_token, args.telegram_chat_id)
+    notifier = TelegramNotifier(args.telegram_bot_token, args.telegram_chat_id, args.telegram_chat_cache_file)
 
     print("[Info] browser domain-mail + Sub2API registrar started")
     print(f"[Info] signup domains: {', '.join(signup_domains)}")
@@ -702,7 +714,10 @@ def main() -> int:
                     account_done = True
                     consecutive_phone_risk = 0
                     try:
-                        notifier.send(f"sub2api success\naccount={created.get('name')}\nid={created.get('id')}\nsuccess={success}")
+                        success_domain = email_addr.split("@", 1)[1] if "@" in email_addr else ""
+                        notifier.send(
+                            f"sub2api success\naccount={created.get('name')}\nemail={email_addr}\ndomain={success_domain}\nid={created.get('id')}\nsuccess={success}"
+                        )
                     except Exception:
                         pass
                     append_history(
@@ -797,8 +812,9 @@ def main() -> int:
                 print(f"[failed] account {idx} exhausted {args.max_attempts} attempts")
                 failed_accounts += 1
                 try:
+                    failed_domain = email_addr.split("@", 1)[1] if "@" in email_addr else ""
                     notifier.send(
-                        f"sub2api failed\naccount_index={idx}\nfailed_after_attempts={args.max_attempts}\nreason={account_last_reason or 'unknown'}"
+                        f"sub2api failed\naccount_index={idx}\nemail={email_addr or 'unknown'}\ndomain={failed_domain or 'unknown'}\nfailed_after_attempts={args.max_attempts}\nreason={account_last_reason or 'unknown'}"
                     )
                 except Exception:
                     pass

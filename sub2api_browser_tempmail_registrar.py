@@ -6,13 +6,15 @@ import random
 import re
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 import registrar_core as registrar
-from sub2api_tempmail_registrar import Sub2APIClient, normalize_base_url, parse_group_ids, parse_mail_sources
+from sub2api_tempmail_registrar import Sub2APIClient, normalize_base_url, parse_mail_sources
 
 
 DEBUG_LOGS = False
@@ -639,6 +641,101 @@ def launch_context(playwright, *, executable_path: str, headless: bool, artifact
     return browser, context
 
 
+class TelegramNotifier:
+    def __init__(self, bot_token: str, chat_id: str, cache_file: str) -> None:
+        self.bot_token = (bot_token or "").strip()
+        self.chat_id = (chat_id or "").strip()
+        self.cache_file = (cache_file or "").strip()
+        if not self.chat_id and self.cache_file:
+            try:
+                self.chat_id = Path(self.cache_file).read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+    def _api_url(self, method: str) -> str:
+        return f"https://api.telegram.org/bot{self.bot_token}/{method}"
+
+    def _resolve_chat_id(self) -> str:
+        if self.chat_id or not self.bot_token:
+            return self.chat_id
+        with urllib.request.urlopen(self._api_url("getUpdates"), timeout=20) as resp:
+            payload = json.loads(resp.read().decode())
+        for item in reversed(payload.get("result") or []):
+            message = item.get("message") or item.get("channel_post") or {}
+            chat = message.get("chat") or {}
+            chat_id = str(chat.get("id") or "").strip()
+            if chat_id:
+                self.chat_id = chat_id
+                if self.cache_file:
+                    try:
+                        Path(self.cache_file).write_text(chat_id, encoding="utf-8")
+                    except Exception:
+                        pass
+                return chat_id
+        return ""
+
+    def send(self, text: str) -> None:
+        if not self.bot_token:
+            return
+        chat_id = self._resolve_chat_id()
+        if not chat_id:
+            return
+        payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(self._api_url("sendMessage"), data=payload, method="POST")
+        with urllib.request.urlopen(req, timeout=20):
+            return
+
+
+def resolve_group_ids(client: Sub2APIClient, group_ids_raw: str, platform: str) -> list[int]:
+    text = (group_ids_raw or "").strip().lower()
+    if not text or text == "all":
+        groups = client.list_groups_all(platform=platform)
+        ids: list[int] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            try:
+                gid = int(group.get("id"))
+            except Exception:
+                continue
+            status = str(group.get("status") or "active").lower()
+            if status != "active":
+                continue
+            ids.append(gid)
+        return ids
+    out: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(int(part))
+    return out
+
+
+def build_identity_model_mapping(models: list[dict[str, Any]]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        mapping[model_id] = model_id
+    return mapping
+
+
+def post_configure_account(client: Sub2APIClient, *, account_id: int, platform: str, group_ids_raw: str) -> dict[str, Any]:
+    account = client.get_account(account_id)
+    credentials = dict(account.get("credentials") or {})
+    group_ids = resolve_group_ids(client, group_ids_raw, platform)
+    models = client.get_available_models(account_id)
+    model_mapping = build_identity_model_mapping(models)
+    if model_mapping:
+        credentials["model_mapping"] = model_mapping
+    updates: dict[str, Any] = {"group_ids": group_ids, "credentials": credentials}
+    return client.update_account(account_id, updates)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Browser-driven tempmail registrar using Chromium + Playwright and Sub2API OAuth bridge."
@@ -654,13 +751,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--login-turnstile-token", default="", help="Optional turnstile token for /auth/login")
     parser.add_argument("--sub2api-proxy-id", type=int, default=None, help="Sub2API proxy_id to bind")
     parser.add_argument("--redirect-uri", default="http://localhost:1455/auth/callback", help="OAuth redirect_uri")
-    parser.add_argument("--group-ids", default="2", help="Account group IDs, comma-separated")
+    parser.add_argument("--group-ids", default="all", help="Account group IDs, comma-separated, or 'all'")
     parser.add_argument("--concurrency", type=int, default=10, help="Account concurrency")
     parser.add_argument("--priority", type=int, default=1, help="Account priority")
     parser.add_argument("--count", type=int, default=1, help="How many accounts to register this run")
     parser.add_argument("--max-attempts", type=int, default=3, help="Max mailbox attempts per target account")
     parser.add_argument("--retry-sleep", type=float, default=3.0, help="Sleep seconds between failed attempts")
     parser.add_argument("--sleep", type=float, default=2.0, help="Sleep seconds between accounts")
+    parser.add_argument("--loop", action="store_true", help="Run continuously instead of stopping after count accounts")
     parser.add_argument("--history-file", default="", help="Optional JSONL run history file")
     parser.add_argument("--mail-sources", default="tempmail_lol,mailtm", help="Comma-separated temp mail sources")
     parser.add_argument("--duckmail-key", default="", help="Optional DuckMail API key")
@@ -668,6 +766,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headless", action="store_true", help="Launch Chromium in headless mode")
     parser.add_argument("--artifacts-dir", default="artifacts", help="Directory for browser profiles and screenshots")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
+    parser.add_argument("--telegram-bot-token", default="", help="Optional Telegram bot token for notifications")
+    parser.add_argument("--telegram-chat-id", default="", help="Optional Telegram chat id; auto-detected from getUpdates if empty")
+    parser.add_argument("--telegram-chat-cache-file", default="telegram_chat_id.txt", help="File used to persist resolved Telegram chat id")
     return parser
 
 
@@ -688,7 +789,6 @@ def main() -> int:
 
     try:
         sub2api_url = normalize_base_url(args.sub2api_url)
-        group_ids = parse_group_ids(args.group_ids)
         mail_sources = parse_mail_sources(args.mail_sources)
         if not args.admin_api_key and not args.admin_token and not args.admin_email:
             raise ValueError("provide --admin-api-key or --admin-token or --admin-email")
@@ -715,6 +815,7 @@ def main() -> int:
         admin_password=admin_password,
         login_turnstile_token=args.login_turnstile_token,
     )
+    notifier = TelegramNotifier(args.telegram_bot_token, args.telegram_chat_id, args.telegram_chat_cache_file)
 
     registrar.DUCKMAIL_KEY = args.duckmail_key or ""
     registrar.MAIL_SOURCES = {
@@ -728,11 +829,30 @@ def main() -> int:
     print(f"[Info] mail sources: {', '.join(mail_sources)}")
 
     success = 0
+    failed_accounts = 0
+    total_attempts = 0
+    skipped_mailboxes = 0
+
+    def print_stats() -> None:
+        processed = success + failed_accounts
+        success_rate = (success / processed * 100.0) if processed else 0.0
+        attempt_success_rate = (success / total_attempts * 100.0) if total_attempts else 0.0
+        print(
+            "[stats] accounts=%s success=%s failed=%s success_rate=%.1f%% attempts=%s attempt_success_rate=%.1f%% skipped=%s"
+            % (processed, success, failed_accounts, success_rate, total_attempts, attempt_success_rate, skipped_mailboxes)
+        )
+
     with sync_playwright() as pw:
-        for idx in range(1, args.count + 1):
+        idx = 0
+        while True:
+            idx += 1
+            if not args.loop and idx > args.count:
+                break
             print(f"\n========== account {idx}/{args.count} ==========")
             account_done = False
+            account_last_reason = ""
             for attempt in range(1, args.max_attempts + 1):
+                total_attempts += 1
                 print(f"[*] attempt {attempt}/{args.max_attempts}")
                 started = time.time()
                 email_addr = ""
@@ -790,21 +910,26 @@ def main() -> int:
                         )
                         session_id_final = session_id_2
 
+                    parsed = registrar._parse_callback_url(callback_url)
                     created = client.create_from_oauth(
                         session_id=session_id_final,
-                        code=registrar._parse_callback_url(callback_url).get("code", ""),
-                        state=registrar._parse_callback_url(callback_url).get("state", ""),
+                        code=parsed.get("code", ""),
+                        state=parsed.get("state", ""),
                         redirect_uri=args.redirect_uri,
                         proxy_id=args.sub2api_proxy_id,
                         name=email_addr,
-                        group_ids=group_ids,
+                        group_ids=[],
                         concurrency=args.concurrency,
                         priority=args.priority,
                     )
+                    account_id = int(created.get("id") or 0)
+                    if account_id > 0:
+                        created = post_configure_account(client, account_id=account_id, platform="openai", group_ids_raw=args.group_ids)
                     print(f"[OK] account created: id={created.get('id')}, name={created.get('name')}")
                     append_history(
                         args.history_file,
                         {
+                            "kind": "attempt",
                             "at": time.time(),
                             "success": True,
                             "email": email_addr,
@@ -813,11 +938,30 @@ def main() -> int:
                             "elapsed_sec": round(time.time() - started, 2),
                         },
                     )
-                    context.close()
                     success += 1
                     account_done = True
+                    try:
+                        notifier.send(
+                            f"sub2api success\naccount={created.get('name')}\nemail={email_addr}\nid={created.get('id')}\nsuccess={success}"
+                        )
+                    except Exception:
+                        pass
+                    append_history(
+                        args.history_file,
+                        {
+                            "kind": "account_result",
+                            "at": time.time(),
+                            "success": True,
+                            "account_index": idx,
+                            "email": email_addr,
+                            "attempts_used": attempt,
+                            "account": created,
+                        },
+                    )
+                    print_stats()
                     break
                 except Exception as exc:
+                    account_last_reason = str(exc)
                     if context is not None:
                         try:
                             page = context.pages[0] if context.pages else None
@@ -829,12 +973,14 @@ def main() -> int:
                             pass
                     reason = str(exc)
                     if isinstance(exc, SkipMailbox):
+                        skipped_mailboxes += 1
                         print(f"[skip] attempt {attempt}: {reason}; switching to next mailbox")
                     else:
                         print(f"[failed] attempt {attempt}: {reason}")
                     append_history(
                         args.history_file,
                         {
+                            "kind": "attempt",
                             "at": time.time(),
                             "success": False,
                             "email": email_addr,
@@ -860,10 +1006,31 @@ def main() -> int:
 
             if not account_done:
                 print(f"[failed] account {idx} exhausted {args.max_attempts} attempts")
-            if idx < args.count and args.sleep > 0:
+                failed_accounts += 1
+                try:
+                    notifier.send(
+                        f"sub2api failed\naccount_index={idx}\nemail={email_addr or 'unknown'}\nfailed_after_attempts={args.max_attempts}\nreason={account_last_reason or 'unknown'}"
+                    )
+                except Exception:
+                    pass
+                append_history(
+                    args.history_file,
+                    {
+                        "kind": "account_result",
+                        "at": time.time(),
+                        "success": False,
+                        "account_index": idx,
+                        "email": email_addr,
+                        "attempts_used": args.max_attempts,
+                        "reason": account_last_reason,
+                    },
+                )
+                print_stats()
+            if (args.loop or idx < args.count) and args.sleep > 0:
                 time.sleep(args.sleep)
 
-    print(f"\nDone: success {success}/{args.count}")
+    total_accounts = success + failed_accounts
+    print(f"\nDone: success {success}/{total_accounts or args.count}")
     return 0
 
 

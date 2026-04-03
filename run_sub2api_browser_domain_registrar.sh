@@ -6,39 +6,20 @@ PYTHON_BIN="${PYTHON_BIN:-$REPO_DIR/.venv/bin/python}"
 XVFB_RUN_BIN="${XVFB_RUN_BIN:-/usr/bin/xvfb-run}"
 
 args=(
-  "$REPO_DIR/sub2api_browser_domain_registrar.py"
+  "$REPO_DIR/sub2api_browser_tempmail_registrar.py"
   --sub2api-url "${SUB2API_URL:?SUB2API_URL is required}"
   --admin-api-key "${SUB2API_ADMIN_API_KEY:?SUB2API_ADMIN_API_KEY is required}"
-  --imap-host "${IMAP_HOST:?IMAP_HOST is required}"
-  --imap-port "${IMAP_PORT:-993}"
-  --imap-user "${IMAP_USER:?IMAP_USER is required}"
-  --imap-password "${IMAP_PASSWORD:?IMAP_PASSWORD is required}"
-  --group-ids "${GROUP_IDS:-2}"
+  --group-ids "${GROUP_IDS:-all}"
   --concurrency "${CONCURRENCY:-10}"
   --priority "${PRIORITY:-1}"
   --count "${COUNT:-1}"
   --max-attempts "${MAX_ATTEMPTS:-1}"
   --retry-sleep "${RETRY_SLEEP:-1}"
   --sleep "${SLEEP_SECONDS:-90}"
-  --domain-failure-cooldown "${DOMAIN_FAILURE_COOLDOWN:-120}"
-  --phone-risk-threshold "${PHONE_RISK_THRESHOLD:-3}"
-  --phone-risk-cooldown "${PHONE_RISK_COOLDOWN:-900}"
-  --history-file "${HISTORY_FILE:-$REPO_DIR/domain_history_service.jsonl}"
-  --state-file "${STATE_FILE:-$REPO_DIR/domain_alias_state.json}"
-  --alias-history-file "${ALIAS_HISTORY_FILE:-$REPO_DIR/domain_alias_allocations.jsonl}"
+  --history-file "${HISTORY_FILE:-$REPO_DIR/tempmail_history_service.jsonl}"
   --artifacts-dir "${ARTIFACTS_DIR:-$REPO_DIR/browser_artifacts}"
-  --mail-local-prefix "${MAIL_LOCAL_PREFIX:-oc}"
-  --start-index "${START_INDEX:-1}"
-  --imap-folder "${IMAP_FOLDER:-INBOX}"
-  --otp-timeout "${OTP_TIMEOUT:-180}"
-  --otp-poll "${OTP_POLL:-3}"
+  --mail-sources "${MAIL_SOURCES:-tempmail_lol,mailtm,onesecmail}"
 )
-
-if [[ -n "${MAIL_DOMAINS:-}" ]]; then
-  args+=(--mail-domains "$MAIL_DOMAINS")
-else
-  args+=(--mail-domain "${MAIL_DOMAIN:?MAIL_DOMAIN or MAIL_DOMAINS is required}")
-fi
 
 if [[ -n "${PROXY:-}" ]]; then
   args+=(--proxy "$PROXY")
@@ -64,16 +45,20 @@ if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
   args+=(--telegram-chat-id "$TELEGRAM_CHAT_ID")
 fi
 
+if [[ -n "${TELEGRAM_CHAT_CACHE_FILE:-}" ]]; then
+  args+=(--telegram-chat-cache-file "$TELEGRAM_CHAT_CACHE_FILE")
+fi
+
+if [[ -n "${DUCKMAIL_KEY:-}" ]]; then
+  args+=(--duckmail-key "$DUCKMAIL_KEY")
+fi
+
 if [[ "${DEBUG:-0}" == "1" ]]; then
   args+=(--debug)
 fi
 
 if [[ "${HEADLESS:-0}" == "1" ]]; then
   args+=(--headless)
-fi
-
-if [[ "${IMAP_INSECURE:-0}" == "1" ]]; then
-  args+=(--imap-insecure)
 fi
 
 if [[ "${SUB2API_INSECURE:-0}" == "1" ]]; then
