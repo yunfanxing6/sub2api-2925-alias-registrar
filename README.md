@@ -110,14 +110,19 @@ Systemd templates:
 - `deploy/sub2api-browser-domain-registrar.service`: compatibility tempmail service
 - `deploy/sub2api-browser-domain-registrar.env.example`: compatibility tempmail env example
 - `deploy/sub2api-browser-domain-registrar.logrotate`: compatibility tempmail logrotate
-- `deploy/sub2api-browser-domain-hourly-registrar.service`: hourly custom-domain service
-- `deploy/sub2api-browser-domain-hourly-registrar.env.example`: hourly custom-domain env example
-- `deploy/sub2api-browser-domain-hourly-registrar.logrotate`: hourly custom-domain logrotate
+- `deploy/sub2api-browser-tempmail-registrar@.service`: multi-instance tempmail service template
+- `deploy/sub2api-browser-tempmail-registrar.env.example`: shared tempmail env example
+- `deploy/sub2api-browser-tempmail-registrar.instance.env.example`: per-instance tempmail env example
+- `deploy/sub2api-browser-tempmail-registrar.logrotate`: tempmail instance logrotate
+- `deploy/sub2api-browser-domain-hourly-registrar.service`: custom-domain service
+- `deploy/sub2api-browser-domain-hourly-registrar.env.example`: custom-domain env example
+- `deploy/sub2api-browser-domain-hourly-registrar.logrotate`: custom-domain logrotate
 
 Notes:
 
 - The compatibility tempmail service loops continuously with `SLEEP_SECONDS=0`.
-- The hourly custom-domain service loops with `SLEEP_SECONDS=3600`.
+- The multi-instance tempmail service can run `@1`, `@2`, `@3` in parallel with per-instance history/artifact files.
+- The custom-domain service loops with `SLEEP_SECONDS=90`.
 - Failed domains are cooled down for `120` seconds before reuse.
 - The production setup can rotate across multiple domains via `--mail-domains`.
 - Telegram notifications are supported via `TELEGRAM_BOT_TOKEN` and optional `TELEGRAM_CHAT_ID` in the env file. If `TELEGRAM_CHAT_ID` is empty, the script tries to auto-discover it from `getUpdates` after you send a message to the bot.

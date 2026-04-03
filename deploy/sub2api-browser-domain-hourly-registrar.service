@@ -1,5 +1,5 @@
 [Unit]
-Description=Sub2API Browser Domain Registrar Hourly
+Description=Sub2API Browser Domain Registrar
 After=network-online.target
 Wants=network-online.target
 
