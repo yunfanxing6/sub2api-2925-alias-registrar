@@ -60,7 +60,7 @@ xvfb-run -a python3 sub2api_browser_tempmail_registrar.py \
   --group-ids "all" \
   --max-attempts 1 \
   --loop \
-  --sleep 90
+  --sleep 0
 ```
 
 Custom-domain mailbox version:
@@ -80,7 +80,7 @@ xvfb-run -a python3 sub2api_browser_domain_registrar.py \
   --domain-failure-cooldown 120
 ```
 
-Loop one registration every 60 seconds:
+Loop one registration every hour:
 
 ```bash
 xvfb-run -a python3 sub2api_browser_domain_registrar.py \
@@ -93,7 +93,8 @@ xvfb-run -a python3 sub2api_browser_domain_registrar.py \
   --imap-user "yunfanxing6@2925.com" \
   --imap-password "YOUR_IMAP_PASSWORD" \
   --loop \
-  --sleep 90 \
+  --sleep 3600 \
+  --phone-risk-cooldown 3600 \
   --max-attempts 1 \
   --domain-failure-cooldown 120
 ```
@@ -106,13 +107,17 @@ python3 sub2api_domain_history_stats.py domain_history_service.jsonl
 
 Systemd templates:
 
-- `deploy/sub2api-browser-domain-registrar.service`
-- `deploy/sub2api-browser-domain-registrar.env.example`
-- `deploy/sub2api-browser-domain-registrar.logrotate`
+- `deploy/sub2api-browser-domain-registrar.service`: compatibility tempmail service
+- `deploy/sub2api-browser-domain-registrar.env.example`: compatibility tempmail env example
+- `deploy/sub2api-browser-domain-registrar.logrotate`: compatibility tempmail logrotate
+- `deploy/sub2api-browser-domain-hourly-registrar.service`: hourly custom-domain service
+- `deploy/sub2api-browser-domain-hourly-registrar.env.example`: hourly custom-domain env example
+- `deploy/sub2api-browser-domain-hourly-registrar.logrotate`: hourly custom-domain logrotate
 
 Notes:
 
-- The service defaults to one account every `90` seconds.
+- The compatibility tempmail service loops continuously with `SLEEP_SECONDS=0`.
+- The hourly custom-domain service loops with `SLEEP_SECONDS=3600`.
 - Failed domains are cooled down for `120` seconds before reuse.
 - The production setup can rotate across multiple domains via `--mail-domains`.
 - Telegram notifications are supported via `TELEGRAM_BOT_TOKEN` and optional `TELEGRAM_CHAT_ID` in the env file. If `TELEGRAM_CHAT_ID` is empty, the script tries to auto-discover it from `getUpdates` after you send a message to the bot.

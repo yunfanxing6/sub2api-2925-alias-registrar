@@ -1,5 +1,5 @@
 [Unit]
-Description=Sub2API Browser Domain Registrar
+Description=Sub2API Browser Tempmail Registrar
 After=network-online.target
 Wants=network-online.target
 

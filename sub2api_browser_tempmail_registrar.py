@@ -757,7 +757,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count", type=int, default=1, help="How many accounts to register this run")
     parser.add_argument("--max-attempts", type=int, default=3, help="Max mailbox attempts per target account")
     parser.add_argument("--retry-sleep", type=float, default=3.0, help="Sleep seconds between failed attempts")
-    parser.add_argument("--sleep", type=float, default=2.0, help="Sleep seconds between accounts")
+    parser.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between accounts")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of stopping after count accounts")
     parser.add_argument("--history-file", default="", help="Optional JSONL run history file")
     parser.add_argument("--mail-sources", default="tempmail_lol,mailtm", help="Comma-separated temp mail sources")
