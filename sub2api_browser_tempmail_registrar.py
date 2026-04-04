@@ -4,13 +4,13 @@ import getpass
 import json
 import random
 import re
-import tempfile
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
+from managed_account_store import ManagedAccountStore, email_domain
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 import registrar_core as registrar
@@ -609,11 +609,12 @@ def perform_auth_flow(
 
 
 def launch_context(playwright, *, executable_path: str, headless: bool, artifacts_dir: str) -> tuple[Browser, BrowserContext]:
-    tempfile.mkdtemp(prefix="pw-openai-", dir=artifacts_dir)
+    del artifacts_dir
     browser = playwright.chromium.launch(
         executable_path=executable_path or None,
         headless=headless,
         args=[
+            "--incognito",
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
             "--no-sandbox",
@@ -765,6 +766,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chromium-path", default="", help="Optional Chromium executable path")
     parser.add_argument("--headless", action="store_true", help="Launch Chromium in headless mode")
     parser.add_argument("--artifacts-dir", default="artifacts", help="Directory for browser profiles and screenshots")
+    parser.add_argument("--managed-accounts-file", default="managed_account_registry.jsonl", help="JSONL file used to track managed account metadata")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     parser.add_argument("--telegram-bot-token", default="", help="Optional Telegram bot token for notifications")
     parser.add_argument("--telegram-chat-id", default="", help="Optional Telegram chat id; auto-detected from getUpdates if empty")
@@ -816,6 +818,7 @@ def main() -> int:
         login_turnstile_token=args.login_turnstile_token,
     )
     notifier = TelegramNotifier(args.telegram_bot_token, args.telegram_chat_id, args.telegram_chat_cache_file)
+    managed_accounts = ManagedAccountStore(args.managed_accounts_file)
 
     registrar.DUCKMAIL_KEY = args.duckmail_key or ""
     registrar.MAIL_SOURCES = {
@@ -926,6 +929,10 @@ def main() -> int:
                     if account_id > 0:
                         created = post_configure_account(client, account_id=account_id, platform="openai", group_ids_raw=args.group_ids)
                     print(f"[OK] account created: id={created.get('id')}, name={created.get('name')}")
+                    managed_accounts.record_tempmail_success(
+                        email_addr=email_addr,
+                        account_id=int(created.get("id") or 0),
+                    )
                     append_history(
                         args.history_file,
                         {
@@ -933,6 +940,7 @@ def main() -> int:
                             "at": time.time(),
                             "success": True,
                             "email": email_addr,
+                            "email_domain": email_domain(email_addr),
                             "attempt": attempt,
                             "account": created,
                             "elapsed_sec": round(time.time() - started, 2),

@@ -14,6 +14,7 @@ from email.header import decode_header, make_header
 from pathlib import Path
 from typing import Any
 
+from managed_account_store import ManagedAccountStore, email_domain as managed_email_domain, normalize_email
 from playwright.sync_api import sync_playwright
 
 import registrar_core as registrar
@@ -407,6 +408,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imap-insecure", action="store_true", help="Skip IMAP TLS certificate validation")
     parser.add_argument("--otp-timeout", type=int, default=180, help="OTP wait timeout seconds")
     parser.add_argument("--otp-poll", type=float, default=3.0, help="OTP polling interval seconds")
+    parser.add_argument("--managed-accounts-file", default="managed_account_registry.jsonl", help="JSONL file used to track managed account metadata")
     return parser
 
 
@@ -516,6 +518,224 @@ def post_configure_account(
     return client.update_account(account_id, updates)
 
 
+def account_error_text(account: dict[str, Any]) -> str:
+    return str(account.get("error_message") or account.get("errorMessage") or "").strip()
+
+
+def is_error_account(account: dict[str, Any]) -> bool:
+    return str(account.get("status") or "").strip().lower() == "error"
+
+
+def reauthorize_domain_account(
+    pw,
+    *,
+    client: Sub2APIClient,
+    imap_client: RoutingIMAPClient,
+    email_addr: str,
+    password: str,
+    proxy: str | None,
+    redirect_uri: str,
+    sub2api_proxy_id: int | None,
+    chromium_path: str,
+    headless: bool,
+    artifacts_dir: str,
+    concurrency: int,
+    priority: int,
+    group_ids_raw: str,
+) -> dict[str, Any]:
+    browser = None
+    context = None
+    auth_url, session_id = client.generate_auth_url(
+        redirect_uri=redirect_uri,
+        proxy_id=sub2api_proxy_id,
+    )
+    dev_token = f"domain:{imap_client.latest_uid()}:{email_addr}"
+    try:
+        browser, context = browser_flow.launch_context(
+            pw,
+            executable_path=chromium_path,
+            headless=headless,
+            artifacts_dir=artifacts_dir,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        callback_url = browser_flow.perform_auth_flow(
+            page=page,
+            auth_url=auth_url,
+            email=email_addr,
+            password=password,
+            dev_token=dev_token,
+            proxies=proxy,
+            redirect_uri=redirect_uri,
+            signup=False,
+        )
+        parsed = registrar._parse_callback_url(callback_url)
+        created = client.create_from_oauth(
+            session_id=session_id,
+            code=parsed.get("code", ""),
+            state=parsed.get("state", ""),
+            redirect_uri=redirect_uri,
+            proxy_id=sub2api_proxy_id,
+            name=email_addr,
+            group_ids=[],
+            concurrency=concurrency,
+            priority=priority,
+        )
+        account_id = int(created.get("id") or 0)
+        if account_id > 0:
+            created = post_configure_account(
+                client,
+                account_id=account_id,
+                platform="openai",
+                group_ids_raw=group_ids_raw,
+            )
+        return created
+    finally:
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+
+
+def repair_error_accounts(
+    pw,
+    *,
+    client: Sub2APIClient,
+    imap_client: RoutingIMAPClient,
+    managed_accounts: ManagedAccountStore,
+    signup_domains: list[str],
+    redirect_uri: str,
+    sub2api_proxy_id: int | None,
+    chromium_path: str,
+    headless: bool,
+    artifacts_dir: str,
+    proxy: str | None,
+    concurrency: int,
+    priority: int,
+    group_ids_raw: str,
+    history_file: str,
+    skip_cache: set[str],
+) -> None:
+    known_accounts = managed_accounts.latest_accounts()
+    custom_domains = {item.strip().lower() for item in signup_domains if item.strip()}
+    for account in client.list_accounts_all(page_size=100):
+        if not isinstance(account, dict):
+            continue
+        if str(account.get("platform") or "").strip().lower() != "openai":
+            continue
+        if str(account.get("type") or "").strip().lower() != "oauth":
+            continue
+        if not is_error_account(account):
+            continue
+        email_addr = normalize_email(str(account.get("name") or ""))
+        if not email_addr or "@" not in email_addr:
+            continue
+
+        account_id = int(account.get("id") or 0)
+        domain = managed_email_domain(email_addr)
+        error_text = account_error_text(account) or "status=error"
+        entry = dict(known_accounts.get(email_addr) or {})
+
+        try:
+            if domain in custom_domains:
+                password = str(entry.get("password") or "")
+                if not password:
+                    if email_addr in skip_cache:
+                        continue
+                    skip_cache.add(email_addr)
+                    print(f"[repair] skip domain error account without saved password: {email_addr}")
+                    append_history(
+                        history_file,
+                        {
+                            "kind": "account_repair",
+                            "at": time.time(),
+                            "success": False,
+                            "action": "skip_domain_error",
+                            "account_id": account_id,
+                            "email": email_addr,
+                            "reason": "missing_saved_password",
+                            "error": error_text,
+                        },
+                    )
+                    continue
+
+                print(f"[repair] deleting errored domain account id={account_id} email={email_addr}")
+                client.delete_account(account_id)
+                created = reauthorize_domain_account(
+                    pw,
+                    client=client,
+                    imap_client=imap_client,
+                    email_addr=email_addr,
+                    password=password,
+                    proxy=proxy,
+                    redirect_uri=redirect_uri,
+                    sub2api_proxy_id=sub2api_proxy_id,
+                    chromium_path=chromium_path,
+                    headless=headless,
+                    artifacts_dir=artifacts_dir,
+                    concurrency=concurrency,
+                    priority=priority,
+                    group_ids_raw=group_ids_raw,
+                )
+                managed_accounts.record_domain_success(
+                    email_addr=email_addr,
+                    domain=domain,
+                    password=password,
+                    account_id=int(created.get("id") or 0),
+                )
+                append_history(
+                    history_file,
+                    {
+                        "kind": "account_repair",
+                        "at": time.time(),
+                        "success": True,
+                        "action": "reauthorize_domain_error",
+                        "deleted_account_id": account_id,
+                        "email": email_addr,
+                        "account": created,
+                        "error": error_text,
+                    },
+                )
+                known_accounts[email_addr] = managed_accounts.get(email_addr)
+                print(f"[repair] reauthorized domain account: id={created.get('id')} name={created.get('name')}")
+                continue
+
+            print(f"[repair] deleting errored tempmail account id={account_id} email={email_addr}")
+            client.delete_account(account_id)
+            append_history(
+                history_file,
+                {
+                    "kind": "account_repair",
+                    "at": time.time(),
+                    "success": True,
+                    "action": "delete_tempmail_error",
+                    "deleted_account_id": account_id,
+                    "email": email_addr,
+                    "error": error_text,
+                },
+            )
+        except Exception as exc:
+            print(f"[repair] failed for {email_addr}: {exc}")
+            append_history(
+                history_file,
+                {
+                    "kind": "account_repair",
+                    "at": time.time(),
+                    "success": False,
+                    "action": "repair_error_account",
+                    "account_id": account_id,
+                    "email": email_addr,
+                    "reason": str(exc),
+                    "error": error_text,
+                },
+            )
+
+
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -580,6 +800,7 @@ def main() -> int:
         login_turnstile_token=args.login_turnstile_token,
     )
     notifier = TelegramNotifier(args.telegram_bot_token, args.telegram_chat_id, args.telegram_chat_cache_file)
+    managed_accounts = ManagedAccountStore(args.managed_accounts_file)
 
     print("[Info] browser domain-mail + Sub2API registrar started")
     print(f"[Info] signup domains: {', '.join(signup_domains)}")
@@ -602,7 +823,26 @@ def main() -> int:
 
     with sync_playwright() as pw:
         idx = 0
+        reported_repair_skips: set[str] = set()
         while True:
+            repair_error_accounts(
+                pw,
+                client=client,
+                imap_client=imap_client,
+                managed_accounts=managed_accounts,
+                signup_domains=signup_domains,
+                redirect_uri=args.redirect_uri,
+                sub2api_proxy_id=args.sub2api_proxy_id,
+                chromium_path=args.chromium_path,
+                headless=args.headless,
+                artifacts_dir=str(artifacts_dir),
+                proxy=args.proxy,
+                concurrency=args.concurrency,
+                priority=args.priority,
+                group_ids_raw=args.group_ids,
+                history_file=args.history_file,
+                skip_cache=reported_repair_skips,
+            )
             idx += 1
             if not args.loop and idx > args.count:
                 break
@@ -689,6 +929,13 @@ def main() -> int:
                             group_ids_raw=args.group_ids,
                         )
                     print(f"[OK] account created: id={created.get('id')}, name={created.get('name')}")
+                    success_domain = managed_email_domain(email_addr)
+                    managed_accounts.record_domain_success(
+                        email_addr=email_addr,
+                        domain=success_domain,
+                        password=password,
+                        account_id=int(created.get("id") or 0),
+                    )
                     state_store.record_result(
                         email_addr=email_addr,
                         success=True,
@@ -705,6 +952,7 @@ def main() -> int:
                             "at": time.time(),
                             "success": True,
                             "email": email_addr,
+                            "email_domain": success_domain,
                             "attempt": attempt,
                             "account": created,
                             "elapsed_sec": round(time.time() - started, 2),
@@ -714,7 +962,6 @@ def main() -> int:
                     account_done = True
                     consecutive_phone_risk = 0
                     try:
-                        success_domain = email_addr.split("@", 1)[1] if "@" in email_addr else ""
                         notifier.send(
                             f"sub2api success\naccount={created.get('name')}\nemail={email_addr}\ndomain={success_domain}\nid={created.get('id')}\nsuccess={success}"
                         )

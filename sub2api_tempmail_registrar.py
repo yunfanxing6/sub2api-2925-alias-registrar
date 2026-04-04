@@ -5,6 +5,7 @@ import json
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -262,6 +263,54 @@ class Sub2APIClient:
     def update_account(self, account_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
         data = self._request_admin_any("PUT", f"/api/v1/admin/accounts/{int(account_id)}", updates)
         return data if isinstance(data, dict) else {}
+
+    def list_accounts_page(self, *, page: int = 1, page_size: int = 100) -> Dict[str, Any]:
+        query = urllib.parse.urlencode({"page": max(1, int(page)), "page_size": max(1, int(page_size))})
+        data = self._request_admin_any("GET", f"/api/v1/admin/accounts?{query}")
+        return data if isinstance(data, dict) else {}
+
+    def list_accounts_all(self, *, page_size: int = 100, max_pages: int = 100) -> List[Dict[str, Any]]:
+        accounts: List[Dict[str, Any]] = []
+        for page in range(1, max(1, max_pages) + 1):
+            payload = self.list_accounts_page(page=page, page_size=page_size)
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                if isinstance(item, dict):
+                    accounts.append(item)
+            try:
+                total = int(payload.get("total") or 0)
+            except Exception:
+                total = 0
+            if total and len(accounts) >= total:
+                break
+            if len(items) < page_size:
+                break
+        return accounts
+
+    def delete_account(self, account_id: int) -> None:
+        path = f"/api/v1/admin/accounts/{int(account_id)}"
+        headers = self._auth_headers()
+        status, body = self._http_json("DELETE", path, headers=headers)
+
+        if (
+            status == 401
+            and not self.admin_api_key
+            and not self.admin_token
+            and self.admin_email
+            and self.admin_password
+        ):
+            with self._lock:
+                self._jwt = self._login_jwt()
+                headers = {"Authorization": f"Bearer {self._jwt}"}
+            status, body = self._http_json("DELETE", path, headers=headers)
+
+        if status == 204:
+            return
+        if status == 200 and (not isinstance(body, dict) or not body or self._ok(body)):
+            return
+        raise RuntimeError(self._error_text(status, body if isinstance(body, dict) else {}))
 
 
 def install_sub2api_bridge(
