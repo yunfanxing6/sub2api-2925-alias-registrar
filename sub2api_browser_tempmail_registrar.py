@@ -734,55 +734,62 @@ def launch_context(playwright, *, executable_path: str, headless: bool, artifact
             "--disable-features=CertVerifierService,ChromeRootStoreUsed",
         ],
     )
-    context = browser.new_context(
+    context_kwargs = dict(
         viewport={"width": 1366, "height": 900},
         locale="zh-CN",
         timezone_id="Asia/Tokyo",
         color_scheme="dark",
         ignore_https_errors=True,
-        user_agent=DEFAULT_CHROME_USER_AGENT,
     )
-    context.add_init_script(
-        """
+    if headless:
+        context_kwargs["user_agent"] = DEFAULT_CHROME_USER_AGENT
+    context = browser.new_context(**context_kwargs)
+
+    base_init_script = """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en-US','en']});
         Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-        Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-        Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-        Object.defineProperty(navigator, 'mimeTypes', {get: () => [1, 2, 3]});
-        Object.defineProperty(navigator, 'userAgentData', {
-          get: () => ({
-            brands: [
-              { brand: 'Chromium', version: '145' },
-              { brand: 'Google Chrome', version: '145' },
-              { brand: 'Not.A/Brand', version: '24' },
-            ],
-            mobile: false,
-            platform: 'Windows',
-            getHighEntropyValues: async () => ({
-              architecture: 'x86',
-              bitness: '64',
-              mobile: false,
-              model: '',
-              platform: 'Windows',
-              platformVersion: '10.0.0',
-              uaFullVersion: '145.0.0.0',
-            }),
-            toJSON: () => ({
-              brands: [
-                { brand: 'Chromium', version: '145' },
-                { brand: 'Google Chrome', version: '145' },
-                { brand: 'Not.A/Brand', version: '24' },
-              ],
-              mobile: false,
-              platform: 'Windows',
-            }),
-          }),
-        });
         window.chrome = window.chrome || { runtime: {} };
-        """
-    )
+    """
+    context.add_init_script(base_init_script)
+    if headless:
+        context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'mimeTypes', {get: () => [1, 2, 3]});
+            Object.defineProperty(navigator, 'userAgentData', {
+              get: () => ({
+                brands: [
+                  { brand: 'Chromium', version: '145' },
+                  { brand: 'Google Chrome', version: '145' },
+                  { brand: 'Not.A/Brand', version: '24' },
+                ],
+                mobile: false,
+                platform: 'Windows',
+                getHighEntropyValues: async () => ({
+                  architecture: 'x86',
+                  bitness: '64',
+                  mobile: false,
+                  model: '',
+                  platform: 'Windows',
+                  platformVersion: '10.0.0',
+                  uaFullVersion: '145.0.0.0',
+                }),
+                toJSON: () => ({
+                  brands: [
+                    { brand: 'Chromium', version: '145' },
+                    { brand: 'Google Chrome', version: '145' },
+                    { brand: 'Not.A/Brand', version: '24' },
+                  ],
+                  mobile: false,
+                  platform: 'Windows',
+                }),
+              }),
+            });
+            """
+        )
     return browser, context
 
 
