@@ -211,7 +211,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--concurrency", type=int, default=10, help="Account concurrency")
     parser.add_argument("--priority", type=int, default=1, help="Account priority")
     parser.add_argument("--count", type=int, default=1, help="How many accounts to register this run")
-    parser.add_argument("--max-attempts", type=int, default=3, help="Max mailbox attempts per target account")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Max mailbox attempts per target account; use 0 for unlimited retries until success")
     parser.add_argument("--attempt-timeout", type=float, default=600.0, help="Hard timeout seconds for a single registration attempt")
     parser.add_argument("--retry-sleep", type=float, default=2.0, help="Sleep seconds between failed attempts")
     parser.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between accounts")
@@ -252,8 +252,10 @@ def main() -> int:
         sub2api_url = normalize_base_url(args.sub2api_url)
         if not args.admin_api_key and not args.admin_token and not args.admin_email:
             raise ValueError("provide --admin-api-key or --admin-token or --admin-email")
-        if args.count <= 0 or args.max_attempts <= 0:
-            raise ValueError("count/max-attempts must be > 0")
+        if args.count <= 0:
+            raise ValueError("count must be > 0")
+        if args.max_attempts < 0:
+            raise ValueError("max-attempts must be >= 0")
         if args.otp_timeout <= 0 or args.otp_poll <= 0:
             raise ValueError("otp timeout/poll must be > 0")
     except Exception as exc:
@@ -328,6 +330,8 @@ def main() -> int:
             % (processed, success, failed_accounts, success_rate, total_attempts, attempt_success_rate, skipped_mailboxes)
         )
 
+    max_attempts_label = "unlimited" if args.max_attempts == 0 else str(args.max_attempts)
+
     with sync_playwright() as pw:
         idx = 0
         while True:
@@ -337,9 +341,13 @@ def main() -> int:
             print(f"\n========== account {idx}/{args.count} ==========")
             account_done = False
             account_last_reason = ""
-            for attempt in range(1, args.max_attempts + 1):
+            attempt = 0
+            while True:
+                attempt += 1
+                if args.max_attempts > 0 and attempt > args.max_attempts:
+                    break
                 total_attempts += 1
-                print(f"[*] attempt {attempt}/{args.max_attempts}")
+                print(f"[*] attempt {attempt}/{max_attempts_label}")
                 started = time.time()
                 email_addr = ""
                 password = ""
@@ -471,7 +479,8 @@ def main() -> int:
                             "elapsed_sec": round(time.time() - started, 2),
                         },
                     )
-                    if attempt < args.max_attempts and args.retry_sleep > 0:
+                    should_retry = args.max_attempts == 0 or attempt < args.max_attempts
+                    if should_retry and args.retry_sleep > 0:
                         time.sleep(args.retry_sleep)
                 finally:
                     try:
@@ -486,10 +495,10 @@ def main() -> int:
                         pass
 
             if not account_done:
-                print(f"[failed] account {idx} exhausted {args.max_attempts} attempts")
+                print(f"[failed] account {idx} exhausted {max_attempts_label} attempts")
                 failed_accounts += 1
                 try:
-                    notifier.send(f"sub2api failed\naccount_index={idx}\nemail={email_addr or 'unknown'}\nfailed_after_attempts={args.max_attempts}\nreason={account_last_reason or 'unknown'}")
+                    notifier.send(f"sub2api failed\naccount_index={idx}\nemail={email_addr or 'unknown'}\nfailed_after_attempts={max_attempts_label}\nreason={account_last_reason or 'unknown'}")
                 except Exception:
                     pass
                 append_history(
@@ -500,7 +509,7 @@ def main() -> int:
                         "success": False,
                         "account_index": idx,
                         "email": email_addr,
-                        "attempts_used": args.max_attempts,
+                        "attempts_used": attempt,
                         "reason": account_last_reason,
                     },
                 )
