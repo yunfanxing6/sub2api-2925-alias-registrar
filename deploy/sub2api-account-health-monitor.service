@@ -1,0 +1,20 @@
+[Unit]
+Description=Sub2API Account Health Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/sub2api-browser-tempmail-registrar
+EnvironmentFile=-/etc/default/sub2api-browser-domain-hourly-registrar
+EnvironmentFile=-/etc/default/sub2api-account-health-monitor
+WorkingDirectory=/root/sub2api-2925-alias-registrar
+ExecStart=/root/sub2api-2925-alias-registrar/run_sub2api_account_health_monitor.sh
+Restart=always
+RestartSec=15
+KillMode=control-group
+StandardOutput=append:/var/log/sub2api-account-health-monitor.log
+StandardError=append:/var/log/sub2api-account-health-monitor.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import getpass
 import json
 import random
 import re
+import signal
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -18,6 +21,12 @@ from sub2api_tempmail_registrar import Sub2APIClient, normalize_base_url, parse_
 
 
 DEBUG_LOGS = False
+DEFAULT_CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+)
+INITIAL_CLOUDFLARE_TIMEOUT_SEC = 180
+STEP_CLOUDFLARE_TIMEOUT_SEC = 120
 
 
 def debug_log(*parts: object) -> None:
@@ -46,6 +55,36 @@ class NeedReauth(RuntimeError):
 
 class SkipMailbox(RuntimeError):
     pass
+
+
+class AttemptTimeout(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def attempt_deadline(timeout_sec: float):
+    timeout_value = float(timeout_sec or 0)
+    if timeout_value <= 0:
+        yield
+        return
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def handle_timeout(signum, frame) -> None:
+        del signum, frame
+        raise AttemptTimeout(f"attempt timed out after {int(timeout_value)}s")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, timeout_value)
+    signal.signal(signal.SIGALRM, handle_timeout)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer != (0.0, 0.0):
+            signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
 
 
 def is_retryable_cert_error(exc: Exception) -> bool:
@@ -77,6 +116,15 @@ def visible_text(page: Page) -> str:
         return page.locator("body").inner_text(timeout=2000)
     except Exception:
         return ""
+
+
+def is_route_error_page(page: Page) -> bool:
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    haystack = "\n".join([title, visible_text(page)]).lower()
+    return any(token in haystack for token in ["route error", "糟糕，出错了", "something went wrong"])
 
 
 def maybe_click(locator) -> bool:
@@ -144,18 +192,75 @@ def click_turnstile_if_present(page: Page) -> bool:
     return clicked
 
 
+def is_cloudflare_challenge(page: Page) -> bool:
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    text = visible_text(page)
+    haystack = "\n".join([page.url, title, text]).lower()
+    markers = [
+        "checking your browser",
+        "just a moment",
+        "please wait while we verify",
+        "verify you are human",
+        "security check",
+        "cloudflare",
+        "ray id",
+        "请稍候",
+        "安全验证",
+        "验证您不是自动程序",
+        "确认您是真人",
+        "由 cloudflare 提供的性能和安全服务",
+    ]
+    if not any(marker in haystack for marker in markers):
+        return False
+    challenge_indicators = [
+        "cloudflare",
+        "ray id",
+        "security",
+        "验证",
+        "自动程序",
+        "真人",
+        "just a moment",
+        "checking your browser",
+    ]
+    return any(indicator in haystack for indicator in challenge_indicators)
+
+
 def wait_cloudflare(page: Page, timeout_sec: int = 60) -> None:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         current_url = page.url
         if "localhost" in current_url and "code=" in current_url:
             return
-        text = visible_text(page)
-        if not any(token in text for token in ["执行安全验证", "Checking your Browser", "Just a moment", "确认您是真人"]):
+        if not is_cloudflare_challenge(page):
             return
         click_turnstile_if_present(page)
         time.sleep(2)
     raise FlowError("cloudflare challenge not cleared")
+
+
+def maybe_retry_route_error(page: Page, *, attempts: int = 2) -> bool:
+    retried = False
+    for _ in range(max(1, attempts)):
+        if not is_route_error_page(page):
+            return retried
+        buttons = [
+            page.get_by_role("button", name=re.compile(r"重试|retry", re.I)),
+            page.get_by_role("link", name=re.compile(r"重试|retry", re.I)),
+        ]
+        clicked = False
+        for button in buttons:
+            if maybe_click(button):
+                clicked = True
+                retried = True
+                break
+        if not clicked:
+            return retried
+        time.sleep(3)
+        wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
+    return retried
 
 
 def find_email_box(page: Page):
@@ -539,7 +644,7 @@ def perform_auth_flow(
     except Exception:
         pass
     time.sleep(4)
-    wait_cloudflare(page, timeout_sec=90)
+    wait_cloudflare(page, timeout_sec=INITIAL_CLOUDFLARE_TIMEOUT_SEC)
 
     if signup:
         ensure_signup_page(page)
@@ -548,7 +653,8 @@ def perform_auth_flow(
             page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass
-        wait_cloudflare(page, timeout_sec=60)
+        wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
+        maybe_retry_route_error(page)
 
     email_box = wait_for_email_box(page, timeout_sec=20)
     if not email_box:
@@ -557,7 +663,8 @@ def perform_auth_flow(
     if not click_continue(page):
         raise FlowError("continue button not found after email")
     time.sleep(3)
-    wait_cloudflare(page, timeout_sec=60)
+    wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
+    maybe_retry_route_error(page)
 
     pwd_box = find_password_box(page)
     if not pwd_box:
@@ -566,7 +673,8 @@ def perform_auth_flow(
     if not click_continue(page):
         raise FlowError("continue button not found after password")
     time.sleep(3)
-    wait_cloudflare(page, timeout_sec=60)
+    wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
+    maybe_retry_route_error(page)
 
     otp_code = ""
     otp_wait_rounds = 0
@@ -584,7 +692,8 @@ def perform_auth_flow(
                 raise FlowError("otp input not found")
             click_continue(page)
             time.sleep(3)
-            wait_cloudflare(page, timeout_sec=60)
+            wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
+            maybe_retry_route_error(page)
             if detect_unsupported_email(page):
                 raise SkipMailbox("unsupported_email")
             if detect_phone_challenge(page):
@@ -598,7 +707,8 @@ def perform_auth_flow(
 
     complete_profile(page)
     time.sleep(3)
-    wait_cloudflare(page, timeout_sec=60)
+    wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
+    maybe_retry_route_error(page)
 
     callback_url = wait_for_callback(page, redirect_uri, timeout_sec=120, requested_callback=requested_callback)
     if callback_url:
@@ -630,12 +740,46 @@ def launch_context(playwright, *, executable_path: str, headless: bool, artifact
         timezone_id="Asia/Tokyo",
         color_scheme="dark",
         ignore_https_errors=True,
+        user_agent=DEFAULT_CHROME_USER_AGENT,
     )
     context.add_init_script(
         """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en-US','en']});
         Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+        Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+        Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        Object.defineProperty(navigator, 'mimeTypes', {get: () => [1, 2, 3]});
+        Object.defineProperty(navigator, 'userAgentData', {
+          get: () => ({
+            brands: [
+              { brand: 'Chromium', version: '145' },
+              { brand: 'Google Chrome', version: '145' },
+              { brand: 'Not.A/Brand', version: '24' },
+            ],
+            mobile: false,
+            platform: 'Windows',
+            getHighEntropyValues: async () => ({
+              architecture: 'x86',
+              bitness: '64',
+              mobile: false,
+              model: '',
+              platform: 'Windows',
+              platformVersion: '10.0.0',
+              uaFullVersion: '145.0.0.0',
+            }),
+            toJSON: () => ({
+              brands: [
+                { brand: 'Chromium', version: '145' },
+                { brand: 'Google Chrome', version: '145' },
+                { brand: 'Not.A/Brand', version: '24' },
+              ],
+              mobile: false,
+              platform: 'Windows',
+            }),
+          }),
+        });
         window.chrome = window.chrome || { runtime: {} };
         """
     )
@@ -757,6 +901,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--priority", type=int, default=1, help="Account priority")
     parser.add_argument("--count", type=int, default=1, help="How many accounts to register this run")
     parser.add_argument("--max-attempts", type=int, default=3, help="Max mailbox attempts per target account")
+    parser.add_argument("--attempt-timeout", type=float, default=600.0, help="Hard timeout seconds for a single registration attempt")
     parser.add_argument("--retry-sleep", type=float, default=3.0, help="Sleep seconds between failed attempts")
     parser.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between accounts")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of stopping after count accounts")
@@ -862,72 +1007,73 @@ def main() -> int:
                 browser = None
                 context = None
                 try:
-                    email_addr, dev_token = registrar.get_email_and_token(args.proxy)
-                    if not email_addr or not dev_token:
-                        raise FlowError("temp mail acquisition failed")
-                    print(f"[*] temp mail acquired: {email_addr}")
-                    password = registrar.secrets.token_urlsafe(18)
+                    with attempt_deadline(args.attempt_timeout):
+                        email_addr, dev_token = registrar.get_email_and_token(args.proxy)
+                        if not email_addr or not dev_token:
+                            raise FlowError("temp mail acquisition failed")
+                        print(f"[*] temp mail acquired: {email_addr}")
+                        password = registrar.secrets.token_urlsafe(18)
 
-                    auth_url_1, session_id_1 = client.generate_auth_url(
-                        redirect_uri=args.redirect_uri,
-                        proxy_id=args.sub2api_proxy_id,
-                    )
-                    print("[*] sub2api generate-auth-url #1 (register)")
-
-                    browser, context = launch_context(
-                        pw,
-                        executable_path=args.chromium_path,
-                        headless=args.headless,
-                        artifacts_dir=str(artifacts_dir),
-                    )
-                    page = context.pages[0] if context.pages else context.new_page()
-
-                    try:
-                        callback_url = perform_auth_flow(
-                            page=page,
-                            auth_url=auth_url_1,
-                            email=email_addr,
-                            password=password,
-                            dev_token=dev_token,
-                            proxies=args.proxy,
-                            redirect_uri=args.redirect_uri,
-                            signup=True,
-                        )
-                        session_id_final = session_id_1
-                    except NeedReauth:
-                        print("[*] phone verification detected, restarting with login auth url")
-                        auth_url_2, session_id_2 = client.generate_auth_url(
+                        auth_url_1, session_id_1 = client.generate_auth_url(
                             redirect_uri=args.redirect_uri,
                             proxy_id=args.sub2api_proxy_id,
                         )
-                        print("[*] sub2api generate-auth-url #2 (login-reauthorize)")
-                        callback_url = perform_auth_flow(
-                            page=page,
-                            auth_url=auth_url_2,
-                            email=email_addr,
-                            password=password,
-                            dev_token=dev_token,
-                            proxies=args.proxy,
-                            redirect_uri=args.redirect_uri,
-                            signup=False,
-                        )
-                        session_id_final = session_id_2
+                        print("[*] sub2api generate-auth-url #1 (register)")
 
-                    parsed = registrar._parse_callback_url(callback_url)
-                    created = client.create_from_oauth(
-                        session_id=session_id_final,
-                        code=parsed.get("code", ""),
-                        state=parsed.get("state", ""),
-                        redirect_uri=args.redirect_uri,
-                        proxy_id=args.sub2api_proxy_id,
-                        name=email_addr,
-                        group_ids=[],
-                        concurrency=args.concurrency,
-                        priority=args.priority,
-                    )
-                    account_id = int(created.get("id") or 0)
-                    if account_id > 0:
-                        created = post_configure_account(client, account_id=account_id, platform="openai", group_ids_raw=args.group_ids)
+                        browser, context = launch_context(
+                            pw,
+                            executable_path=args.chromium_path,
+                            headless=args.headless,
+                            artifacts_dir=str(artifacts_dir),
+                        )
+                        page = context.pages[0] if context.pages else context.new_page()
+
+                        try:
+                            callback_url = perform_auth_flow(
+                                page=page,
+                                auth_url=auth_url_1,
+                                email=email_addr,
+                                password=password,
+                                dev_token=dev_token,
+                                proxies=args.proxy,
+                                redirect_uri=args.redirect_uri,
+                                signup=True,
+                            )
+                            session_id_final = session_id_1
+                        except NeedReauth:
+                            print("[*] phone verification detected, restarting with login auth url")
+                            auth_url_2, session_id_2 = client.generate_auth_url(
+                                redirect_uri=args.redirect_uri,
+                                proxy_id=args.sub2api_proxy_id,
+                            )
+                            print("[*] sub2api generate-auth-url #2 (login-reauthorize)")
+                            callback_url = perform_auth_flow(
+                                page=page,
+                                auth_url=auth_url_2,
+                                email=email_addr,
+                                password=password,
+                                dev_token=dev_token,
+                                proxies=args.proxy,
+                                redirect_uri=args.redirect_uri,
+                                signup=False,
+                            )
+                            session_id_final = session_id_2
+
+                        parsed = registrar._parse_callback_url(callback_url)
+                        created = client.create_from_oauth(
+                            session_id=session_id_final,
+                            code=parsed.get("code", ""),
+                            state=parsed.get("state", ""),
+                            redirect_uri=args.redirect_uri,
+                            proxy_id=args.sub2api_proxy_id,
+                            name=email_addr,
+                            group_ids=[],
+                            concurrency=args.concurrency,
+                            priority=args.priority,
+                        )
+                        account_id = int(created.get("id") or 0)
+                        if account_id > 0:
+                            created = post_configure_account(client, account_id=account_id, platform="openai", group_ids_raw=args.group_ids)
                     print(f"[OK] account created: id={created.get('id')}, name={created.get('name')}")
                     managed_accounts.record_tempmail_success(
                         email_addr=email_addr,

@@ -1,0 +1,18 @@
+[Unit]
+Description=Sub2API Browser Duck Registrar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/sub2api-browser-duck-registrar
+WorkingDirectory=/root/sub2api-2925-alias-registrar
+ExecStart=/root/sub2api-2925-alias-registrar/run_sub2api_browser_duck_registrar.sh
+Restart=always
+RestartSec=15
+KillMode=control-group
+StandardOutput=append:/var/log/sub2api-browser-duck-registrar.log
+StandardError=append:/var/log/sub2api-browser-duck-registrar.log
+
+[Install]
+WantedBy=multi-user.target

@@ -116,6 +116,37 @@ class Sub2APIClient:
             except json.JSONDecodeError:
                 return exc.code, {"message": raw}
 
+    def _http_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Tuple[int, str]:
+        req_headers = {"Accept": "text/plain, application/json, text/event-stream"}
+        if headers:
+            req_headers.update(headers)
+
+        data = None
+        if payload is not None:
+            req_headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+
+        req = urllib.request.Request(
+            url=f"{self.base_url}{path}",
+            data=data,
+            method=method.upper(),
+            headers=req_headers,
+        )
+        context = ssl._create_unverified_context() if self.insecure else None
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=context) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+
     @staticmethod
     def _ok(body: Dict[str, Any]) -> bool:
         return isinstance(body, dict) and body.get("code") == 0
@@ -311,6 +342,85 @@ class Sub2APIClient:
         if status == 200 and (not isinstance(body, dict) or not body or self._ok(body)):
             return
         raise RuntimeError(self._error_text(status, body if isinstance(body, dict) else {}))
+
+    @staticmethod
+    def _parse_sse_events(raw: str) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        data_lines: List[str] = []
+        for line in str(raw or "").splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+                continue
+            if line.strip():
+                continue
+            if not data_lines:
+                continue
+            payload = "\n".join(data_lines).strip()
+            data_lines = []
+            if not payload:
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                events.append({"raw": payload})
+                continue
+            events.append(parsed if isinstance(parsed, dict) else {"raw": parsed})
+
+        if data_lines:
+            payload = "\n".join(data_lines).strip()
+            if payload:
+                try:
+                    parsed = json.loads(payload)
+                except json.JSONDecodeError:
+                    events.append({"raw": payload})
+                else:
+                    events.append(parsed if isinstance(parsed, dict) else {"raw": parsed})
+
+        return events
+
+    def test_account(self, account_id: int, *, model_id: str = "", prompt: str = "") -> Dict[str, Any]:
+        path = f"/api/v1/admin/accounts/{int(account_id)}/test"
+        payload: Dict[str, Any] = {}
+        if model_id.strip():
+            payload["model_id"] = model_id.strip()
+        if prompt.strip():
+            payload["prompt"] = prompt.strip()
+
+        headers = self._auth_headers()
+        headers["Accept"] = "text/event-stream"
+        status, raw = self._http_text("POST", path, payload=payload, headers=headers)
+
+        if (
+            status == 401
+            and not self.admin_api_key
+            and not self.admin_token
+            and self.admin_email
+            and self.admin_password
+        ):
+            with self._lock:
+                self._jwt = self._login_jwt()
+                headers = {
+                    "Authorization": f"Bearer {self._jwt}",
+                    "Accept": "text/event-stream",
+                }
+            status, raw = self._http_text("POST", path, payload=payload, headers=headers)
+
+        parsed_body: Dict[str, Any] = {}
+        if raw.strip().startswith("{"):
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                parsed_body = decoded
+
+        return {
+            "status": status,
+            "ok": status == 200,
+            "body": parsed_body,
+            "raw": raw,
+            "events": self._parse_sse_events(raw),
+        }
 
 
 def install_sub2api_bridge(

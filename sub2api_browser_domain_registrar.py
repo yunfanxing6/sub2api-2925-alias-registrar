@@ -20,7 +20,7 @@ from playwright.sync_api import sync_playwright
 import registrar_core as registrar
 import sub2api_browser_tempmail_registrar as browser_flow
 from sub2api_2925_alias_registrar import IMAP2925Client, OTP_REGEX, extract_message_text, now_iso
-from sub2api_browser_tempmail_registrar import FlowError, NeedReauth, SkipMailbox, append_history
+from sub2api_browser_tempmail_registrar import AttemptTimeout, FlowError, NeedReauth, SkipMailbox, append_history, attempt_deadline
 from sub2api_tempmail_registrar import Sub2APIClient, normalize_base_url
 
 
@@ -380,6 +380,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--priority", type=int, default=1, help="Account priority")
     parser.add_argument("--count", type=int, default=1, help="How many accounts to register this run")
     parser.add_argument("--max-attempts", type=int, default=5, help="Max mailbox attempts per target account")
+    parser.add_argument("--attempt-timeout", type=float, default=600.0, help="Hard timeout seconds for a single registration attempt")
     parser.add_argument("--retry-sleep", type=float, default=2.0, help="Sleep seconds between failed attempts")
     parser.add_argument("--sleep", type=float, default=90.0, help="Sleep seconds between accounts")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of stopping after count accounts")
@@ -858,76 +859,77 @@ def main() -> int:
                 browser = None
                 context = None
                 try:
-                    email_addr, dev_token = registrar.get_email_and_token(args.proxy)
-                    if not email_addr or not dev_token:
-                        raise FlowError("domain mailbox allocation failed")
-                    password = registrar.secrets.token_urlsafe(18)
+                    with attempt_deadline(args.attempt_timeout):
+                        email_addr, dev_token = registrar.get_email_and_token(args.proxy)
+                        if not email_addr or not dev_token:
+                            raise FlowError("domain mailbox allocation failed")
+                        password = registrar.secrets.token_urlsafe(18)
 
-                    auth_url_1, session_id_1 = client.generate_auth_url(
-                        redirect_uri=args.redirect_uri,
-                        proxy_id=args.sub2api_proxy_id,
-                    )
-                    print("[*] sub2api generate-auth-url #1 (register)")
-
-                    browser, context = browser_flow.launch_context(
-                        pw,
-                        executable_path=args.chromium_path,
-                        headless=args.headless,
-                        artifacts_dir=str(artifacts_dir),
-                    )
-                    page = context.pages[0] if context.pages else context.new_page()
-
-                    try:
-                        callback_url = browser_flow.perform_auth_flow(
-                            page=page,
-                            auth_url=auth_url_1,
-                            email=email_addr,
-                            password=password,
-                            dev_token=dev_token,
-                            proxies=args.proxy,
-                            redirect_uri=args.redirect_uri,
-                            signup=True,
-                        )
-                        session_id_final = session_id_1
-                    except NeedReauth:
-                        print("[*] phone verification detected, restarting with login auth url")
-                        auth_url_2, session_id_2 = client.generate_auth_url(
+                        auth_url_1, session_id_1 = client.generate_auth_url(
                             redirect_uri=args.redirect_uri,
                             proxy_id=args.sub2api_proxy_id,
                         )
-                        print("[*] sub2api generate-auth-url #2 (login-reauthorize)")
-                        callback_url = browser_flow.perform_auth_flow(
-                            page=page,
-                            auth_url=auth_url_2,
-                            email=email_addr,
-                            password=password,
-                            dev_token=dev_token,
-                            proxies=args.proxy,
-                            redirect_uri=args.redirect_uri,
-                            signup=False,
-                        )
-                        session_id_final = session_id_2
+                        print("[*] sub2api generate-auth-url #1 (register)")
 
-                    parsed = registrar._parse_callback_url(callback_url)
-                    created = client.create_from_oauth(
-                        session_id=session_id_final,
-                        code=parsed.get("code", ""),
-                        state=parsed.get("state", ""),
-                        redirect_uri=args.redirect_uri,
-                        proxy_id=args.sub2api_proxy_id,
-                        name=email_addr,
-                        group_ids=[],
-                        concurrency=args.concurrency,
-                        priority=args.priority,
-                    )
-                    account_id = int(created.get("id") or 0)
-                    if account_id > 0:
-                        created = post_configure_account(
-                            client,
-                            account_id=account_id,
-                            platform="openai",
-                            group_ids_raw=args.group_ids,
+                        browser, context = browser_flow.launch_context(
+                            pw,
+                            executable_path=args.chromium_path,
+                            headless=args.headless,
+                            artifacts_dir=str(artifacts_dir),
                         )
+                        page = context.pages[0] if context.pages else context.new_page()
+
+                        try:
+                            callback_url = browser_flow.perform_auth_flow(
+                                page=page,
+                                auth_url=auth_url_1,
+                                email=email_addr,
+                                password=password,
+                                dev_token=dev_token,
+                                proxies=args.proxy,
+                                redirect_uri=args.redirect_uri,
+                                signup=True,
+                            )
+                            session_id_final = session_id_1
+                        except NeedReauth:
+                            print("[*] phone verification detected, restarting with login auth url")
+                            auth_url_2, session_id_2 = client.generate_auth_url(
+                                redirect_uri=args.redirect_uri,
+                                proxy_id=args.sub2api_proxy_id,
+                            )
+                            print("[*] sub2api generate-auth-url #2 (login-reauthorize)")
+                            callback_url = browser_flow.perform_auth_flow(
+                                page=page,
+                                auth_url=auth_url_2,
+                                email=email_addr,
+                                password=password,
+                                dev_token=dev_token,
+                                proxies=args.proxy,
+                                redirect_uri=args.redirect_uri,
+                                signup=False,
+                            )
+                            session_id_final = session_id_2
+
+                        parsed = registrar._parse_callback_url(callback_url)
+                        created = client.create_from_oauth(
+                            session_id=session_id_final,
+                            code=parsed.get("code", ""),
+                            state=parsed.get("state", ""),
+                            redirect_uri=args.redirect_uri,
+                            proxy_id=args.sub2api_proxy_id,
+                            name=email_addr,
+                            group_ids=[],
+                            concurrency=args.concurrency,
+                            priority=args.priority,
+                        )
+                        account_id = int(created.get("id") or 0)
+                        if account_id > 0:
+                            created = post_configure_account(
+                                client,
+                                account_id=account_id,
+                                platform="openai",
+                                group_ids_raw=args.group_ids,
+                            )
                     print(f"[OK] account created: id={created.get('id')}, name={created.get('name')}")
                     success_domain = managed_email_domain(email_addr)
                     managed_accounts.record_domain_success(

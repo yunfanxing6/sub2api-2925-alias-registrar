@@ -102,3 +102,16 @@ class ManagedAccountStore:
                 "last_account_id": int(account_id or 0),
             }
         )
+
+    def record_duck_success(self, *, email_addr: str, password: str, account_id: int) -> None:
+        self._append_event(
+            {
+                "kind": "managed_account",
+                "at": time.time(),
+                "source": "duck",
+                "email": normalize_email(email_addr),
+                "domain": email_domain(email_addr),
+                "password": password,
+                "last_account_id": int(account_id or 0),
+            }
+        )

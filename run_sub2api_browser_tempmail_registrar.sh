@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-/root/sub2api-2925-alias-registrar}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-$REPO_DIR/.venv/bin/python}"
 XVFB_RUN_BIN="${XVFB_RUN_BIN:-/usr/bin/xvfb-run}"
 
@@ -14,10 +15,12 @@ args=(
   --priority "${PRIORITY:-1}"
   --count "${COUNT:-1}"
   --max-attempts "${MAX_ATTEMPTS:-1}"
+  --attempt-timeout "${ATTEMPT_TIMEOUT:-600}"
   --retry-sleep "${RETRY_SLEEP:-1}"
   --sleep "${SLEEP_SECONDS:-0}"
   --history-file "${HISTORY_FILE:-$REPO_DIR/tempmail_history_service.jsonl}"
   --artifacts-dir "${ARTIFACTS_DIR:-$REPO_DIR/browser_artifacts}"
+  --managed-accounts-file "${MANAGED_ACCOUNTS_FILE:-$REPO_DIR/managed_account_registry.jsonl}"
   --mail-sources "${MAIL_SOURCES:-tempmail_lol,mailtm,onesecmail}"
 )
 
@@ -45,9 +48,7 @@ if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
   args+=(--telegram-chat-id "$TELEGRAM_CHAT_ID")
 fi
 
-if [[ -n "${TELEGRAM_CHAT_CACHE_FILE:-}" ]]; then
-  args+=(--telegram-chat-cache-file "$TELEGRAM_CHAT_CACHE_FILE")
-fi
+args+=(--telegram-chat-cache-file "${TELEGRAM_CHAT_CACHE_FILE:-$REPO_DIR/telegram_chat_id.txt}")
 
 if [[ -n "${DUCKMAIL_KEY:-}" ]]; then
   args+=(--duckmail-key "$DUCKMAIL_KEY")
