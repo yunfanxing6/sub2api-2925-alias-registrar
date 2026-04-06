@@ -201,6 +201,7 @@ class IMAP2925Client:
         password: str,
         folder: str,
         insecure: bool,
+        timeout: int = 20,
     ) -> None:
         self.host = host
         self.port = port
@@ -208,13 +209,15 @@ class IMAP2925Client:
         self.password = password
         self.folder = folder
         self.insecure = insecure
+        self.timeout = max(5, int(timeout or 20))
 
     def _connect(self) -> imaplib.IMAP4_SSL:
         ctx = ssl.create_default_context()
         if self.insecure:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-        conn = imaplib.IMAP4_SSL(self.host, self.port, ssl_context=ctx)
+        # Bound IMAP stalls so OTP polling can recover instead of hanging forever.
+        conn = imaplib.IMAP4_SSL(self.host, self.port, ssl_context=ctx, timeout=self.timeout)
         conn.login(self.username, self.password)
         conn.select(self.folder, readonly=True)
         return conn

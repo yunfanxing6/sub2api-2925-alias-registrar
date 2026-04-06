@@ -16,7 +16,7 @@ args=(
   --priority "${PRIORITY:-1}"
   --count "${COUNT:-1}"
   --max-attempts "${MAX_ATTEMPTS:-1}"
-  --attempt-timeout "${ATTEMPT_TIMEOUT:-600}"
+  --attempt-timeout "${ATTEMPT_TIMEOUT:-1200}"
   --retry-sleep "${RETRY_SLEEP:-1}"
   --sleep "${SLEEP_SECONDS:-0}"
   --history-file "${HISTORY_FILE:-$REPO_DIR/duck_history_service.jsonl}"
@@ -86,4 +86,4 @@ if [[ "${LOOP:-1}" == "1" ]]; then
   args+=(--loop)
 fi
 
-exec "$XVFB_RUN_BIN" -a "$PYTHON_BIN" "${args[@]}"
+exec env PYTHONUNBUFFERED=1 "$XVFB_RUN_BIN" -a "$PYTHON_BIN" "${args[@]}"

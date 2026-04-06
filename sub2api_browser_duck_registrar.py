@@ -5,6 +5,7 @@ import getpass
 import json
 import re
 import secrets
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -75,11 +76,12 @@ def load_blocked_duck_aliases_from_history(history_file: str) -> set[str]:
                 continue
             if not isinstance(row, dict):
                 continue
-            if str(row.get("kind") or "") != "account_result":
-                continue
-            if not bool(row.get("success")):
-                continue
-            email_addr = normalize_duck_alias(str(row.get("email") or ""))
+            kind = str(row.get("kind") or "")
+            email_addr = ""
+            if kind == "account_result" and bool(row.get("success")):
+                email_addr = normalize_duck_alias(str(row.get("email") or ""))
+            elif kind == "attempt" and bool(row.get("skip_mailbox")):
+                email_addr = normalize_duck_alias(str(row.get("email") or ""))
             if email_addr:
                 blocked.add(email_addr)
     except Exception:
@@ -239,10 +241,12 @@ class DuckExtensionProvider:
         self.login_timeout = max(30, int(login_timeout or 120))
         self.login_poll_interval = max(1.0, float(login_poll_interval or 3.0))
         self.imap_client = imap_client
+        self.playwright = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
 
     def start(self, playwright) -> None:
+        self.playwright = playwright
         if self.context is not None:
             return
         self.browser_profile_dir.mkdir(parents=True, exist_ok=True)
@@ -275,6 +279,14 @@ class DuckExtensionProvider:
             self.context = None
             self.page = None
 
+    def reset_profile(self) -> None:
+        self.close()
+        shutil.rmtree(self.browser_profile_dir, ignore_errors=True)
+        self.browser_profile_dir.mkdir(parents=True, exist_ok=True)
+        if self.playwright is None:
+            raise FlowError("duck playwright context not initialized")
+        self.start(self.playwright)
+
     def _ensure_page(self) -> Page:
         if self.page is None:
             raise FlowError("duck browser page not initialized")
@@ -287,7 +299,38 @@ class DuckExtensionProvider:
 
     def _is_signed_in(self, page: Page) -> bool:
         text = browser_flow.visible_text(page)
-        return f"{self.duck_username}@duck.com" in text and "Private Duck Address Generator" in text
+        if f"{self.duck_username}@duck.com" in text and "Private Duck Address Generator" in text:
+            return True
+        if self._read_current_alias(page):
+            return True
+        try:
+            button = page.get_by_role("button", name=re.compile(r"Generate Private Duck Address", re.I))
+            return button.count() > 0 and button.first.is_visible()
+        except Exception:
+            return False
+
+    def _find_login_textbox(self, page: Page):
+        candidates = [
+            page.locator("input:not([readonly])"),
+            page.locator("input[type='text']:not([readonly])"),
+            page.get_by_role("textbox"),
+        ]
+        for locator in candidates:
+            try:
+                count = locator.count()
+            except Exception:
+                count = 0
+            for idx in range(count):
+                item = locator.nth(idx)
+                try:
+                    if not item.is_visible():
+                        continue
+                    if item.get_attribute("readonly") is not None:
+                        continue
+                    return item
+                except Exception:
+                    continue
+        return None
 
     def _read_current_alias(self, page: Page) -> str:
         for locator in [page.locator("input[type='text']"), page.get_by_role("textbox")]:
@@ -367,8 +410,12 @@ class DuckExtensionProvider:
                 if not browser_flow.maybe_click(page.get_by_role("button", name=re.compile(r"Resend", re.I))):
                     raise FlowError("duck resend button not found")
             else:
-                textbox = page.get_by_role("textbox")
-                textbox.wait_for(timeout=30000)
+                textbox = self._find_login_textbox(page)
+                if textbox is None:
+                    if attempt >= 3:
+                        raise FlowError("duck login textbox not found")
+                    page = self._goto_autofill()
+                    continue
                 textbox.fill(self.duck_username)
                 if not browser_flow.maybe_click(page.get_by_role("button", name=re.compile(r"Continue", re.I))):
                     raise FlowError("duck continue button not found")
@@ -401,8 +448,8 @@ class DuckExtensionProvider:
         exclude_aliases: set[str] | None = None,
         max_refresh_attempts: int = 3,
         refresh_sleep_sec: float = 1.0,
+        allow_profile_reset: bool = True,
     ) -> tuple[str, dict[str, str]]:
-        del proxies
         page = self._ensure_signed_in()
         blocked = {normalize_duck_alias(item) for item in (exclude_aliases or set()) if normalize_duck_alias(item)}
         attempts = max(1, int(max_refresh_attempts or 1))
@@ -411,21 +458,32 @@ class DuckExtensionProvider:
             current_alias = self._read_current_alias(page)
             if current_alias and current_alias not in blocked:
                 return current_alias, {"source": "browser_extension", "username": self.duck_username, "alias": current_alias}
+            before_click_alias = current_alias or previous_alias
             if not browser_flow.maybe_click(page.get_by_role("button", name=re.compile(r"Generate Private Duck Address", re.I))):
                 raise FlowError("duck generate button not found")
             deadline = time.time() + 15
             while time.time() < deadline:
                 alias = self._read_current_alias(page)
-                if alias and alias != previous_alias:
+                if alias and alias != before_click_alias:
                     previous_alias = alias
                     break
                 time.sleep(0.5)
             current_alias = self._read_current_alias(page)
-            previous_alias = current_alias or previous_alias
+            previous_alias = current_alias or before_click_alias or previous_alias
             if current_alias and current_alias not in blocked:
                 return current_alias, {"source": "browser_extension", "username": self.duck_username, "alias": current_alias}
             if idx < attempts and refresh_sleep_sec > 0:
                 time.sleep(refresh_sleep_sec)
+        if allow_profile_reset and previous_alias:
+            print(f"[warn] duck alias {previous_alias} stayed blocked; resetting Duck browser profile")
+            self.reset_profile()
+            return self.generate_alias(
+                proxies=proxies,
+                exclude_aliases=blocked,
+                max_refresh_attempts=max_refresh_attempts,
+                refresh_sleep_sec=refresh_sleep_sec,
+                allow_profile_reset=False,
+            )
         raise SkipMailbox(f"duck alias did not rotate from blocked alias: {previous_alias or 'unknown'}")
 
 
@@ -775,8 +833,8 @@ def main() -> int:
                         account_done = True
                         try:
                             notifier.send(f"sub2api success\naccount={created.get('name')}\nemail={current_email}\nid={created.get('id')}\nsuccess={success}")
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            print(f"[warn] telegram notification failed: {exc}")
                         append_history(
                             args.history_file,
                             {

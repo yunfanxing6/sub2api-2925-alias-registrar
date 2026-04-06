@@ -545,6 +545,22 @@ def detect_unsupported_email(page: Page) -> bool:
         or "unsupported_email" in page.url.lower()
 
 
+def detect_existing_account(page: Page) -> bool:
+    text = visible_text(page).lower()
+    url = page.url.lower()
+    markers = [
+        "already have an account",
+        "account already exists",
+        "already exists with this email",
+        "an account already exists",
+        "与此电子邮件地址相关联的帐户已存在",
+        "与此电子邮件地址关联的帐户已存在",
+        "该邮箱已有账户",
+        "该电子邮件地址已有账户",
+    ]
+    return any(token in text for token in markers) or ("create-account/password" in url and "已存在" in text)
+
+
 def is_email_otp_page(page: Page) -> bool:
     text = visible_text(page).lower()
     url = page.url.lower()
@@ -600,6 +616,8 @@ def wait_for_callback(page: Page, redirect_uri: str, timeout_sec: int = 90, requ
                     clicked_consent = True
                     time.sleep(3)
                     continue
+        if detect_existing_account(page):
+            raise SkipMailbox("account already exists for email")
         if detect_unsupported_email(page):
             raise SkipMailbox("unsupported_email")
         if detect_phone_challenge(page):
@@ -665,6 +683,8 @@ def perform_auth_flow(
     time.sleep(3)
     wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
     maybe_retry_route_error(page)
+    if detect_existing_account(page):
+        raise SkipMailbox("account already exists for email")
 
     pwd_box = find_password_box(page)
     if not pwd_box:
@@ -675,6 +695,8 @@ def perform_auth_flow(
     time.sleep(3)
     wait_cloudflare(page, timeout_sec=STEP_CLOUDFLARE_TIMEOUT_SEC)
     maybe_retry_route_error(page)
+    if detect_existing_account(page):
+        raise SkipMailbox("account already exists for email")
 
     otp_code = ""
     otp_wait_rounds = 0
