@@ -248,8 +248,8 @@ class RoutingIMAPClient(IMAP2925Client):
         timeout_sec: int,
         poll_interval_sec: float,
     ) -> tuple[str, int]:
-        del target_email
         deadline = time.time() + max(1, timeout_sec)
+        target = (target_email or "").strip().lower()
 
         while time.time() < deadline:
             print(".", end="", flush=True)
@@ -274,11 +274,19 @@ class RoutingIMAPClient(IMAP2925Client):
 
                     msg = email.message_from_bytes(raw_email)
                     sender = decode_header_str(msg.get("From", ""))
+                    to_header = decode_header_str(msg.get("To", ""))
+                    delivered_to = decode_header_str(msg.get("Delivered-To", ""))
+                    orig_to = decode_header_str(msg.get("X-Original-To", ""))
                     subject = decode_header_str(msg.get("Subject", ""))
                     body = extract_message_text(msg)
-                    header_blob = "\n".join(f"{k}: {v}" for k, v in msg.items())
-                    haystack = "\n".join([sender, subject, body, header_blob]).lower()
-                    if "openai" not in haystack and "chatgpt" not in haystack:
+                    haystack = "\n".join([sender, subject, body]).lower()
+                    route_headers = "\n".join([to_header, delivered_to, orig_to]).lower()
+                    has_route_headers = any([to_header.strip(), delivered_to.strip(), orig_to.strip()])
+
+                    if all(token not in haystack and token not in route_headers for token in ["openai", "chatgpt"]):
+                        continue
+
+                    if target and has_route_headers and target not in route_headers:
                         continue
 
                     m = OTP_REGEX.search("\n".join([subject, body]))

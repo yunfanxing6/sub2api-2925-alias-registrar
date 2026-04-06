@@ -28,7 +28,12 @@ args=(
   --imap-folder "${IMAP_FOLDER:-INBOX}"
   --otp-timeout "${OTP_TIMEOUT:-180}"
   --otp-poll "${OTP_POLL:-3}"
-  --duck-profile-dir "${DUCK_PROFILE_DIR:-$DEFAULT_HOME/.config/google-chrome/Default}"
+  --duck-username "${DUCK_USERNAME:?DUCK_USERNAME is required}"
+  --duck-recovery-email "${DUCK_RECOVERY_EMAIL:-${IMAP_USER:-yunfanxing6@2925.com}}"
+  --duck-extension-path "${DUCK_EXTENSION_PATH:?DUCK_EXTENSION_PATH is required}"
+  --duck-browser-profile-dir "${DUCK_BROWSER_PROFILE_DIR:-$REPO_DIR/duck_browser_profile}"
+  --duck-login-timeout "${DUCK_LOGIN_TIMEOUT:-180}"
+  --duck-login-poll "${DUCK_LOGIN_POLL:-3}"
 )
 
 if [[ -n "${PROXY:-}" ]]; then
@@ -56,26 +61,6 @@ if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
 fi
 
 args+=(--telegram-chat-cache-file "${TELEGRAM_CHAT_CACHE_FILE:-$REPO_DIR/telegram_chat_id.txt}")
-
-if [[ -n "${DUCK_TOKEN:-}" ]]; then
-  args+=(--duck-token "$DUCK_TOKEN")
-fi
-
-if [[ -n "${DUCK_TOKEN_FILE:-}" ]]; then
-  args+=(--duck-token-file "$DUCK_TOKEN_FILE")
-fi
-
-if [[ -n "${DUCK_EXTENSION_ID:-}" ]]; then
-  args+=(--duck-extension-id "$DUCK_EXTENSION_ID")
-fi
-
-if [[ -n "${DUCK_ALIAS_API_URL:-}" ]]; then
-  args+=(--duck-alias-api-url "$DUCK_ALIAS_API_URL")
-fi
-
-if [[ -n "${DUCK_REQUEST_TIMEOUT:-}" ]]; then
-  args+=(--duck-request-timeout "$DUCK_REQUEST_TIMEOUT")
-fi
 
 if [[ -n "${IMAP_PASSWORD:-}" ]]; then
   args+=(--imap-password "$IMAP_PASSWORD")
